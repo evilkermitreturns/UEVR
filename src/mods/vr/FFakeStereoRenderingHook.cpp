@@ -45,6 +45,7 @@
 #include "Framework.hpp"
 #include "Mods.hpp"
 #include "mods/UObjectHook.hpp"
+#include "ue3d/UE3D_MonitorState.hpp"
 
 #include <bdshemu.h>
 #include <bddisasm.h>
@@ -1034,6 +1035,13 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
     if (!m_calculate_stereo_projection_matrix_hook) {
         SPDLOG_ERROR("Failed to create CalculateStereoProjectionMatrix hook");
     }
+
+    // InitCanvas: save vtable entry for deferred hook creation (toggle in UI)
+    // Not created here — upstream intentionally left it unhooked because the vtable index
+    // (CalculateStereoProjectionMatrix + 1) may be wrong for some games, causing crashes.
+    // Hook is created/destroyed on demand when the user enables "Canvas HUD Hook" toggle.
+    m_init_canvas_vtable_entry = (void**)init_canvas_func_ptr;
+    SPDLOG_INFO("InitCanvas vtable entry saved at index {} (deferred hook)", init_canvas_index);
 
     // This requires a pointer hook because the virtual just returns false
     // compiler optimization makes that function get re-used in a lot of places
@@ -2051,7 +2059,8 @@ FRHITexture2D** FFakeStereoRenderingHook::viewport_get_render_target_texture_hoo
     const auto og = g_hook->m_viewport_get_render_target_texture_hook->get_original<decltype(&viewport_get_render_target_texture_hook)>();
     const auto& vr = VR::get();
 
-    if (!vr->is_ahud_compatibility_enabled() || !vr->is_hmd_active() || g_hook->m_slate_draw_window_thread_id == 0) {
+    const auto is_ue3d_monitor = ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed);
+    if (!vr->is_ahud_compatibility_enabled() || (!vr->is_hmd_active() && !is_ue3d_monitor) || g_hook->m_slate_draw_window_thread_id == 0) {
         return og(viewport);
     }
 
@@ -2277,7 +2286,7 @@ void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewport
 
     auto vr = VR::get();
 
-    if (!vr->is_hmd_active()) {
+    if (!vr->is_hmd_active() && !ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
         call_orig();
         return;
     }
@@ -2883,13 +2892,81 @@ bool FFakeStereoRenderingHook::is_in_viewport_client_draw() const {
     return m_in_viewport_client_draw && GameThreadWorker::get().is_same_thread();
 }
 
+// Monitor mode sceneview handler: FOV extraction + UE5 crash guard.
+// Called from sceneview_constructor when bMonitorMode is active.
+// Returns the constructed FSceneView* and increments last_index.
+static sdk::FSceneView* sceneview_monitor_mode(
+    sdk::FSceneView* view,
+    sdk::FSceneViewInitOptions* init_options,
+    sdk::FSceneViewInitOptionsUE5* init_options_ue5,
+    void* a3, void* a4,
+    bool is_ue5,
+    uint32_t& last_index,
+    safetyhook::InlineHook& constructor_hook)
+{
+    // FOV extraction from projection matrix
+    const float m00 = is_ue5
+        ? (float)init_options_ue5->projection_matrix[0][0]
+        : init_options->projection_matrix[0][0];
+    if (m00 > ue3d::constants::M00_MIN_THRESHOLD) {
+        const float extracted_fov = 2.0f * std::atan(1.0f / m00) * ue3d::constants::DEG_PER_RAD;
+        auto& ms = ue3d::MonitorState::get();
+        if (extracted_fov > ue3d::constants::FOV_MIN && extracted_fov < ue3d::constants::FOV_MAX) {
+            // Only write if GameFOV hasn't already written this frame (it's the primary writer)
+            const uint32_t current_frame = g_frame_count;
+            if (ms.uGameFOV_WriterFrame.load(std::memory_order_relaxed) != current_frame) {
+                ms.fGameFOV_FromMatrix.store(extracted_fov, std::memory_order_relaxed);
+                if (!ms.bFOVCalibrated.load(std::memory_order_relaxed)) {
+                    ms.bFOVCalibrated.store(true, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
+    // Eye separation is handled in calculate_stereo_view_offset callback (not here).
+    // sceneview_constructor only does FOV extraction + UE5 crash guard for monitor mode.
+
+    // UE5 crash prevention: hide secondary views from FSceneView constructor.
+    // Some UE5 games crash when constructor sees views->count > 1.
+    // Unconditional for monitor mode — not gated on VR-specific toggles.
+    const auto stereo_pass = init_options->get_stereo_pass();
+    std::optional<uint32_t> views_original_count{};
+
+    if (stereo_pass > EStereoscopicPass::eSSP_PRIMARY) {
+        init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
+
+        auto view_family = init_options->get_view_family();
+        auto views = view_family != nullptr ? view_family->get_views() : nullptr;
+
+        if (views != nullptr) {
+            views_original_count = views->count;
+            views->count = 0;
+        }
+    }
+
+    auto result = constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
+
+    if (views_original_count.has_value()) {
+        auto view_family = init_options->get_view_family();
+        auto views = view_family != nullptr ? view_family->get_views() : nullptr;
+
+        if (views != nullptr) {
+            views->count = views_original_count.value();
+        }
+    }
+
+    ++last_index;
+    return result;
+}
+
 // FSceneView constructor hook
 sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options, void* a3, void* a4) {
     SPDLOG_INFO_ONCE("Called FSceneView constructor for the first time");
 
     auto& vr = VR::get();
 
-    if (!g_hook->is_in_viewport_client_draw() || !vr->is_hmd_active()) {
+    const auto is_ue3d_monitor = ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed);
+    if (!g_hook->is_in_viewport_client_draw() || (!vr->is_hmd_active() && !is_ue3d_monitor)) {
         return g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
     }
 
@@ -2939,6 +3016,12 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     last_frame_count = g_frame_count;
 
     const auto true_index = vr->is_using_afr() ? (g_frame_count + last_index) % 2 : last_index;
+
+    // Monitor mode: FOV extraction + UE5 crash guard (early return)
+    if (is_ue3d_monitor) {
+        return sceneview_monitor_mode(view, init_options, init_options_ue5, a3, a4, is_ue5, last_index,
+            g_hook->m_sceneview_data.constructor_hook);
+    }
 
     if (vr->is_splitscreen_compatibility_enabled() || vr->is_sceneview_compatibility_enabled()) {
         int32_t w = vr->get_hmd_width();
@@ -3178,7 +3261,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     auto& vr = VR::get();
     auto rtm = g_hook->get_render_target_manager();
 
-    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled()) {
+    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
         rtm->destroy_scene_capture();
 
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
@@ -4473,6 +4556,16 @@ bool FFakeStereoRenderingHook::attempt_runtime_inject_stereo() {
     return true;
 }
 
+// Monitor mode uses two patterns across the 6 stereo functions:
+//
+// Early return: monitor mode does its own work and returns before the VR path.
+//   adjust_view_rect, calculate_stereo_view_offset, sceneview_constructor.
+//
+// Modify-fall-through: VR projection runs first, monitor mode adjusts the result.
+//   calculate_stereo_projection_matrix, init_canvas.
+//
+// is_stereo_enabled: bMonitorMode OR'd into the enable decision (no local gate).
+
 bool FFakeStereoRenderingHook::is_stereo_enabled(FFakeStereoRendering* stereo) {
 #ifdef FFAKE_STEREO_RENDERING_LOG_ALL_CALLS
     SPDLOG_INFO("is stereo enabled called!");
@@ -4511,14 +4604,17 @@ bool FFakeStereoRenderingHook::is_stereo_enabled(FFakeStereoRendering* stereo) {
     if (hook->m_has_game_viewport_client_draw_hook) {
         if (GameThreadWorker::get().is_same_thread()) {
             if (hook->m_in_viewport_client_draw && !hook->m_was_in_viewport_client_draw) {
+                // Monitor mode: OR'd into enable decision
                 const auto is_hmd_active = VR::get()->is_hmd_active();
+                const auto is_ue3d_monitor = ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed);
+                const auto should_enable = is_hmd_active || is_ue3d_monitor;
 
-                if (!last_state && is_hmd_active) {
+                if (!last_state && should_enable) {
                     VR::get()->wait_for_present();
                     hook->set_should_recreate_textures(true);
                 }
 
-                last_state = is_hmd_active;
+                last_state = should_enable;
             }
 
             hook->m_was_in_viewport_client_draw = hook->m_in_viewport_client_draw;
@@ -4540,7 +4636,7 @@ bool FFakeStereoRenderingHook::is_stereo_enabled(FFakeStereoRendering* stereo) {
         return true;
     }
 
-    const auto result = !VR::get()->get_runtime()->got_first_sync || VR::get()->is_hmd_active();
+    const auto result = !VR::get()->get_runtime()->got_first_sync || VR::get()->is_hmd_active() || ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed);
 
     if (result && !last_state) {
         hook->set_should_recreate_textures(true);
@@ -4590,6 +4686,27 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
         *w = std::min<uint32_t>(VR::get()->get_hmd_width(), *w);
         *h = std::min<uint32_t>(VR::get()->get_hmd_height(), *h);
         --g_hook->m_skip_next_adjust_view_rect_count;
+        return;
+    }
+
+    // Monitor mode: SBS viewport split (early return)
+    if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+        const auto vr = VR::get();
+        const uint32_t half_w = vr->get_hmd_width();
+        const uint32_t eye_h = vr->get_hmd_height();
+
+        auto true_index = index_starts_from_one ? ((index + 1) % 2) : (index % 2);
+        // SS fix: use g_frame_count for ALL AFR modes (matches VR path).
+        // With synced sequential, view_index is always 0 (1 view per draw),
+        // but g_frame_count increments between the two FViewport::Draw invocations.
+        if (vr->is_using_afr()) {
+            true_index = g_frame_count % 2;
+        }
+
+        *x = half_w * true_index;
+        *y = 0;
+        *w = half_w;
+        *h = eye_h;
         return;
     }
 
@@ -4657,6 +4774,69 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
     const auto has_double_precision = g_hook->m_has_double_precision;
     const auto rot_d = (Rotator<double>*)view_rotation;
+
+    // Monitor mode: rotation lock + eye offset (early return)
+    // VR mode does rotation + eye offset in this callback. Monitor mode does the same
+    // but with symmetric math (parallel cameras, no HMD rotation).
+    auto& ms = ue3d::MonitorState::get();
+    if (ms.bMonitorMode.load(std::memory_order_relaxed) && !is_full_pass) {
+        // SS fix: use g_frame_count for ALL AFR modes (matches VR path).
+        // With synced sequential, view_index is always 0 (1 view per draw),
+        // but g_frame_count increments between the two FViewport::Draw invocations.
+        if (vr->is_using_afr()) {
+            true_index = g_frame_count % 2;
+        }
+
+        // Rotation locking: parallel cameras (both eyes same orientation)
+        if (true_index == 0) {
+            if (has_double_precision) { g_hook->m_last_afr_rotation_double = *rot_d; }
+            else { g_hook->m_last_afr_rotation = *view_rotation; }
+        } else {
+            if (has_double_precision) { *rot_d = g_hook->m_last_afr_rotation_double; }
+            else { *view_rotation = g_hook->m_last_afr_rotation; }
+        }
+
+        // Eye separation using view rotation's right vector
+        const float stereo_depth = ms.stereo_depth_safe();
+        const float dyn_depth = ms.dyn_depth_safe();
+        const float strength = ms.strength_safe();
+        const float world_scale = std::max(0.01f, std::min(vr->get_world_to_meters(), 10000.0f));
+        ms.fCachedWorldScale.store(world_scale, std::memory_order_relaxed);
+        const float eye_sign = (true_index == 0) ? -1.0f : 1.0f;
+        const float eye_offset = eye_sign * stereo_depth * dyn_depth * strength * world_scale * 0.5f;
+
+        // Right vector from view rotation (Rotator has pitch/yaw/roll) — lesson 97
+        float yaw_rad, pitch_rad, roll_rad;
+        if (!has_double_precision) {
+            pitch_rad = glm::radians(view_rotation->pitch);
+            yaw_rad = glm::radians(view_rotation->yaw);
+            roll_rad = glm::radians(view_rotation->roll);
+        } else {
+            pitch_rad = glm::radians((float)rot_d->pitch);
+            yaw_rad = glm::radians((float)rot_d->yaw);
+            roll_rad = glm::radians((float)rot_d->roll);
+        }
+        // Full UE4 rotation matrix right vector (Y-axis with roll)
+        const float cy = std::cos(yaw_rad), sy = std::sin(yaw_rad);
+        const float cp = std::cos(pitch_rad), sp = std::sin(pitch_rad);
+        const float cr = std::cos(roll_rad), sr = std::sin(roll_rad);
+        const float right_x = -(sy * cr + cy * sp * sr);
+        const float right_y =  (cy * cr - sy * sp * sr);
+        const float right_z =  cp * sr;
+
+        if (!has_double_precision) {
+            view_location->x += eye_offset * right_x;
+            view_location->y += eye_offset * right_y;
+            view_location->z += eye_offset * right_z;
+        } else {
+            auto loc_d = (Vector3d*)view_location;
+            loc_d->x += (double)(eye_offset * right_x);
+            loc_d->y += (double)(eye_offset * right_y);
+            loc_d->z += (double)(eye_offset * right_z);
+        }
+
+        return;
+    }
 
     if (vr->is_using_afr() && !is_full_pass) {
         true_index = g_frame_count % 2;
@@ -5055,6 +5235,30 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             const auto fmat = VR::get()->get_projection_matrix((VRRuntime::Eye)(true_index));
             double_matrix = fmat;
         }
+
+        // Monitor mode: convergence shift (modify-fall-through, needs VR projection first)
+        auto& ms = ue3d::MonitorState::get();
+        if (view_index != -1 && ms.bMonitorMode.load(std::memory_order_relaxed)) {
+            const float stereo_depth = ms.stereo_depth_safe();
+            const float convergence = ms.convergence_safe();
+            const float dyn_conv = ms.dyn_conv_safe();
+            const float strength = ms.strength_safe();
+            const float world_scale = ms.world_scale_safe();
+
+            // SS fix: true_index from g_frame_count%2 IS correct for synced sequential.
+            // g_frame_count increments between the two FViewport::Draw invocations,
+            // and view_index is always 0 with SS (1 view per draw). No override needed.
+            const float eye_sign = (true_index == 0) ? -1.0f : 1.0f;
+
+            float shift = eye_sign * stereo_depth * dyn_conv * strength * world_scale * 0.5f / convergence;
+            shift = std::max(-ue3d::constants::CONVERGENCE_SHIFT_CLAMP, std::min(ue3d::constants::CONVERGENCE_SHIFT_CLAMP, shift));
+
+            if (!g_hook->m_has_double_precision) {
+                (*out)[2][0] += shift;
+            } else {
+                double_matrix[2][0] += (double)shift;
+            }
+        }
     } else {
         SPDLOG_ERROR("CalculateStereoProjectionMatrix returned nullptr!");
     }
@@ -5123,6 +5327,31 @@ __forceinline void FFakeStereoRenderingHook::render_texture_render_thread(FFakeS
     /*if (g_hook->m_render_texture_render_thread_hook) {
         g_hook->m_render_texture_render_thread_hook->call<void*>(stereo, rhi_command_list, backbuffer, src_texture, window_size);
     }*/
+}
+
+bool FFakeStereoRenderingHook::set_init_canvas_hook_enabled(bool enabled) {
+    if (enabled) {
+        if (m_init_canvas_hook) return true;  // already active
+        if (!m_init_canvas_vtable_entry) {
+            SPDLOG_ERROR("[UE3D] Cannot create InitCanvas hook: vtable entry not saved");
+            return false;
+        }
+        try {
+            m_init_canvas_hook = std::make_unique<PointerHook>(
+                m_init_canvas_vtable_entry, (void*)init_canvas);
+            SPDLOG_INFO("[UE3D] InitCanvas hook created (toggle)");
+            return true;
+        } catch (const std::exception& e) {
+            SPDLOG_ERROR("[UE3D] Failed to create InitCanvas hook: {}", e.what());
+            return false;
+        }
+    } else {
+        if (m_init_canvas_hook) {
+            m_init_canvas_hook.reset();
+            SPDLOG_INFO("[UE3D] InitCanvas hook removed (toggle)");
+        }
+        return true;
+    }
 }
 
 void FFakeStereoRenderingHook::init_canvas(FFakeStereoRendering* stereo, sdk::FSceneView* view, UCanvas* canvas) {
@@ -5200,8 +5429,41 @@ void FFakeStereoRenderingHook::init_canvas(FFakeStereoRendering* stereo, sdk::FS
         }
     }
 
-    //*(Matrix4x4f*)((uintptr_t)view + fsceneview_viewproj_offset) = VR::get()->get_projection_matrix(VRRuntime::Eye::LEFT);
-    *(Matrix4x4f*)((uintptr_t)canvas + ucanvas_viewproj_offset) = *(Matrix4x4f*)((uintptr_t)view + fsceneview_viewproj_offset);
+    // Monitor mode: two-mode HUD depth via direct assignment to canvas VP[2][0]
+    // VR mode: original behavior (unconditional canvas VP copy, no depth modification)
+    auto& ms = ue3d::MonitorState::get();
+    if (ms.bMonitorMode.load(std::memory_order_relaxed)) {
+        // Copy scene ViewProjectionMatrix to canvas (provides base transform)
+        *(Matrix4x4f*)((uintptr_t)canvas + ucanvas_viewproj_offset) =
+            *(Matrix4x4f*)((uintptr_t)view + fsceneview_viewproj_offset);
+
+        auto& canvas_mat = *(Matrix4x4f*)((uintptr_t)canvas + ucanvas_viewproj_offset);
+
+        // Eye determination: g_frame_count % 2 for all AFR modes (lesson #103)
+        const uint32_t true_index = g_frame_count % 2;
+        const float eye_sign = (true_index == 0) ? -1.0f : 1.0f;
+
+        // Read stereo calibration + per-mode HUD depth target
+        const float stereo_depth    = ms.stereo_depth_safe();
+        const float convergence     = ms.convergence_safe();
+        const float hud_depth_target = ms.hud_depth_target_safe(); // EMA-smoothed per-mode depth
+
+        // Single formula: per-mode slider value drives HUD parallax
+        // scale=2.0 maps slider ±1.0 to approx scene convergence magnitude
+        const float scale = 2.0f;
+        float shift = eye_sign * stereo_depth * hud_depth_target * scale / convergence;
+        shift = std::clamp(shift, -0.2f, 0.2f);
+
+        // Direct assignment: overwrite VP[2][0] with our known convergence shift
+        canvas_mat[2][0] = shift;
+
+        SPDLOG_INFO_ONCE("[UE3D] init_canvas: per-mode HUD depth active "
+            "(shift={:.4f}, target={:.2f}, eye={})", shift, hud_depth_target, true_index);
+    } else {
+        // VR mode: original unconditional canvas VP copy (init_canvas was never hooked before)
+        *(Matrix4x4f*)((uintptr_t)canvas + ucanvas_viewproj_offset) =
+            *(Matrix4x4f*)((uintptr_t)view + fsceneview_viewproj_offset);
+    }
 }
 
 uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoRendering* stereo, bool is_stereo_enabled) {
@@ -5215,6 +5477,11 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
 
     if (g_hook->m_sceneview_data.inside_post_init_properties) {
         return 2;
+    }
+
+    // Monitor mode view count
+    if (is_stereo_enabled && ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+        return (vr->is_using_afr() && !vr->is_splitscreen_compatibility_enabled()) ? 1 : 2;
     }
 
     if (!is_stereo_enabled || (vr->is_using_afr() && !vr->is_splitscreen_compatibility_enabled())) {
@@ -5281,7 +5548,7 @@ IStereoRenderTargetManager* FFakeStereoRenderingHook::get_render_target_manager_
         return nullptr;
     }
 
-    if (!vr->get_runtime()->got_first_poses || vr->is_hmd_active()) {
+    if (!vr->get_runtime()->got_first_poses || vr->is_hmd_active() || ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
         if (g_hook->m_uses_old_rendertarget_manager) {
             return (IStereoRenderTargetManager*)&g_hook->m_rtm_418;
         }
@@ -5887,7 +6154,7 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
 
     auto vr = VR::get();
 
-    if (!vr->is_hmd_active() || vr->is_stereo_emulation_enabled()) {
+    if ((!vr->is_hmd_active() && !ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) || vr->is_stereo_emulation_enabled()) {
         return call_orig();
     }
 

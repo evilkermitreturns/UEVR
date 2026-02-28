@@ -4,6 +4,7 @@
 
 #include <d3d12.h>
 #include <dxgi.h>
+#include <atomic>
 #include <mutex>
 #include <wrl.h>
 
@@ -44,6 +45,11 @@ public:
     auto& openxr() { return m_openxr; }
     auto& get_openvr_ui_tex() { return m_openvr.ui_tex; }
 
+    // Depth readback for monitor mode DepthAnalyzer (mirrors D3D11Component)
+    float get_center_depth_value() const {
+        return m_center_depth_value.load(std::memory_order_relaxed);
+    }
+
 private:
     bool setup();
     std::unique_ptr<DirectX::DX12::SpriteBatch> setup_sprite_batch_pso(
@@ -75,6 +81,15 @@ private:
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_ui_batch_alpha_invert{};
 
     ID3D12Resource* m_last_checked_native{nullptr};
+
+    // Depth readback for monitor mode DepthAnalyzer (mirrors D3D11Component)
+    ComPtr<ID3D12Resource> m_depth_readback_buffer{};
+    d3d12::CommandContext m_depth_readback_commands{};
+    uint32_t m_depth_staging_width{0};
+    uint32_t m_depth_staging_height{0};
+    std::atomic<float> m_center_depth_value{0.0f};
+    DXGI_FORMAT m_depth_format{DXGI_FORMAT_UNKNOWN};
+    uint32_t m_depth_readback_skip{0};
 
     // Mimicking what OpenXR does.
     struct OpenVR {

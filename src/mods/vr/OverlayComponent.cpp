@@ -4,6 +4,8 @@
 #include "Framework.hpp"
 #include "../VR.hpp"
 #include "../utility/ImGui.hpp"
+#include "ue3d/UE3D_MonitorState.hpp"
+#include "VRto3DBridge.hpp"
 
 #include "OverlayComponent.hpp"
 
@@ -222,6 +224,32 @@ void OverlayComponent::on_draw_ui() {
 
         m_slate_distance->draw("UI Distance");
         m_slate_size->draw("UI Size");
+
+        if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+            auto& ms = ue3d::MonitorState::get();
+            const float hud_mult = ms.hud_depth_mult_safe();
+
+            const float raw_dist = m_slate_distance->value();
+            const float eff_dist = raw_dist * std::max(0.1f, hud_mult);
+            const float convergence = ms.convergence_safe();
+            const float stereo_depth = ms.stereo_depth_safe();
+            const float dyn_conv = ms.dyn_conv_safe();
+            const float strength = ms.strength_safe();
+
+            ImGui::TextDisabled("HUD Dist: %.2fm (raw=%.1f * hud=%.2f)",
+                eff_dist, raw_dist, hud_mult);
+            ImGui::TextDisabled("Conv: %.2f  StereoD: %.4f  DynConv: %.3f  Str: %.2f",
+                convergence, stereo_depth, dyn_conv, strength);
+
+            // Show VRto3D base depth vs UEVR stereo_depth for mismatch diagnosis
+            const float v3d_depth = VRto3DBridge::get().get_vrto3d_depth();
+            if (v3d_depth > 0.001f && stereo_depth > 0.001f) {
+                const float mismatch_pct = (1.0f - v3d_depth / stereo_depth) * 100.0f;
+                ImGui::TextDisabled("V3D Base: %.4f  UEVR: %.4f  Mismatch: %.0f%%",
+                    v3d_depth, stereo_depth, mismatch_pct);
+            }
+        }
+
         m_ui_follows_view->draw("UI Follows View");
         ImGui::SameLine();
         m_ui_invert_alpha->draw("UI Invert Alpha");
@@ -339,42 +367,70 @@ void OverlayComponent::update_slate_openvr() {
 
     vr::VROverlay()->SetOverlayTextureBounds(m_slate_overlay_handle, &bounds);
 
-    vr::TrackedDevicePose_t pose{};
-    vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, &pose, 1);
+    auto glm_matrix = glm::identity<glm::mat4>();
 
-    auto rotation_offset = glm::inverse(vr->get_rotation_offset());
+    // ---- Monitor mode: identity-relative overlay positioning ----
+    if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+        auto& ms = ue3d::MonitorState::get();
+        const float hud_mult = ms.hud_depth_mult_safe();
+        const float distance = m_slate_distance->value() * std::max(0.1f, hud_mult);
 
-    if (vr->is_decoupled_pitch_enabled() && vr->is_decoupled_pitch_ui_adjust_enabled()) {
-        const auto pre_flat_rotation = vr->get_pre_flattened_rotation();
-        const auto pre_flat_pitch = utility::math::pitch_only(pre_flat_rotation);
+        const float display_fov = ms.display_base_fov_safe();
+        const float fov_rad = glm::radians(std::max(ue3d::constants::OVERLAY_FOV_MIN, display_fov));
+        const float half_h = distance * std::tan(fov_rad * 0.5f);
 
-        // Add the inverse of the pitch rotation to the rotation offset
-        rotation_offset = glm::normalize(glm::inverse(pre_flat_pitch * vr->get_rotation_offset()));
-    }
+        glm_matrix[3] -= glm_matrix[2] * distance;
+        glm_matrix[3] += m_slate_x_offset->value() * glm_matrix[0];
+        glm_matrix[3] += m_slate_y_offset->value() * glm_matrix[1];
+        glm_matrix[3].w = 1.0f;
 
-    //auto glm_matrix = glm::rowMajor4(Matrix4x4f{*(Matrix3x4f*)&pose.mDeviceToAbsoluteTracking});
-    auto glm_matrix = Matrix4x4f{rotation_offset};
-    if (m_ui_follows_view->value()) {
-        const auto mat = glm::rowMajor4(Matrix4x4f{*(Matrix3x4f*)&pose.mDeviceToAbsoluteTracking});
-        glm_matrix = glm::extractMatrixRotation(mat);
-        glm_matrix[3] += mat[3];
+        const auto steamvr_matrix = Matrix3x4f{glm::rowMajor4(glm_matrix)};
+        vr::VROverlay()->SetOverlayTransformAbsolute(m_slate_overlay_handle, vr::TrackingUniverseStanding, (vr::HmdMatrix34_t*)&steamvr_matrix);
+
+        const auto is_d3d12 = g_framework->get_renderer_type() == Framework::RendererType::D3D12;
+        const auto size = is_d3d12 ? g_framework->get_d3d12_rt_size() : g_framework->get_d3d11_rt_size();
+        const auto aspect = size.x / size.y;
+        const float size_scale = m_slate_size->value() / 2.0f;  // m_slate_size default=2.0, so /2.0 = neutral
+        const auto width_meters = half_h * aspect * 2.0f * size_scale;
+        vr::VROverlay()->SetOverlayWidthInMeters(m_slate_overlay_handle, width_meters);
     } else {
-        glm_matrix[3] += vr->get_standing_origin();
+        // ---- VR mode: original overlay positioning ----
+        vr::TrackedDevicePose_t pose{};
+        vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, &pose, 1);
+
+        auto rotation_offset = glm::inverse(vr->get_rotation_offset());
+
+        if (vr->is_decoupled_pitch_enabled() && vr->is_decoupled_pitch_ui_adjust_enabled()) {
+            const auto pre_flat_rotation = vr->get_pre_flattened_rotation();
+            const auto pre_flat_pitch = utility::math::pitch_only(pre_flat_rotation);
+
+            // Add the inverse of the pitch rotation to the rotation offset
+            rotation_offset = glm::normalize(glm::inverse(pre_flat_pitch * vr->get_rotation_offset()));
+        }
+
+        glm_matrix = Matrix4x4f{rotation_offset};
+        if (m_ui_follows_view->value()) {
+            const auto mat = glm::rowMajor4(Matrix4x4f{*(Matrix3x4f*)&pose.mDeviceToAbsoluteTracking});
+            glm_matrix = glm::extractMatrixRotation(mat);
+            glm_matrix[3] += mat[3];
+        } else {
+            glm_matrix[3] += vr->get_standing_origin();
+        }
+
+        glm_matrix[3] -= glm_matrix[2] * m_slate_distance->value();
+        glm_matrix[3] += m_slate_x_offset->value() * glm_matrix[0];
+        glm_matrix[3] += m_slate_y_offset->value() * glm_matrix[1];
+        glm_matrix[3].w = 1.0f;
+
+        const auto steamvr_matrix = Matrix3x4f{glm::rowMajor4(glm_matrix)};
+        vr::VROverlay()->SetOverlayTransformAbsolute(m_slate_overlay_handle, vr::TrackingUniverseStanding, (vr::HmdMatrix34_t*)&steamvr_matrix);
+
+        const auto is_d3d12 = g_framework->get_renderer_type() == Framework::RendererType::D3D12;
+        const auto size = is_d3d12 ? g_framework->get_d3d12_rt_size() : g_framework->get_d3d11_rt_size();
+        const auto aspect = size.x / size.y;
+        const auto width_meters = m_slate_size->value() * aspect;
+        vr::VROverlay()->SetOverlayWidthInMeters(m_slate_overlay_handle, width_meters);
     }
-
-    glm_matrix[3] -= glm_matrix[2] * m_slate_distance->value();
-    glm_matrix[3] += m_slate_x_offset->value() * glm_matrix[0];
-    glm_matrix[3] += m_slate_y_offset->value() * glm_matrix[1];
-    glm_matrix[3].w = 1.0f;
-    
-    const auto steamvr_matrix = Matrix3x4f{glm::rowMajor4(glm_matrix)};
-    vr::VROverlay()->SetOverlayTransformAbsolute(m_slate_overlay_handle, vr::TrackingUniverseStanding, (vr::HmdMatrix34_t*)&steamvr_matrix);
-
-    const auto is_d3d12 = g_framework->get_renderer_type() == Framework::RendererType::D3D12;
-    const auto size = is_d3d12 ? g_framework->get_d3d12_rt_size() : g_framework->get_d3d11_rt_size();
-    const auto aspect = size.x / size.y;
-    const auto width_meters = m_slate_size->value() * aspect;
-    vr::VROverlay()->SetOverlayWidthInMeters(m_slate_overlay_handle, width_meters);
 
     if (is_d3d11) {
         if (vr->m_d3d11.get_ui_tex().Get() == nullptr) {
@@ -837,34 +893,101 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     layer.eyeVisibility = eye;
 
     auto glm_matrix = glm::identity<glm::mat4>();
+    float meters_w = 0.0f;
+    float meters_h = 0.0f;
 
-    if (vr->m_overlay_component.m_ui_follows_view->value()) {
-        layer.space = vr->m_openxr->view_space;
+    // ---- Monitor mode: camera-relative overlay pinned to convergence distance ----
+    if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+        auto& ms = ue3d::MonitorState::get();
+        layer.space = vr->m_openxr->view_space; // Camera-relative (VRto3D reports identity pose)
+
+        // Pin distance to convergence plane, modulated by HUD depth
+        const float hud_mult = ms.hud_depth_mult_safe();
+        const float distance = m_parent->m_slate_distance->value() * std::max(0.1f, hud_mult);
+
+        // Size overlay to fill display frustum at this distance
+        const float display_fov = ms.display_base_fov_safe();
+        const float fov_rad = glm::radians(std::max(ue3d::constants::OVERLAY_FOV_MIN, display_fov));
+        const float half_h = distance * std::tan(fov_rad * 0.5f);
+        const float aspect = (float)ui_swapchain.width / (float)ui_swapchain.height;
+
+        const float hud_size_mult = ms.hud_size_target_safe(); // per-mode size multiplier (EMA-smoothed)
+        const float size_scale = (m_parent->m_slate_size->value() / 2.0f) * hud_size_mult;
+        meters_w = half_h * aspect * 2.0f * size_scale;
+        meters_h = half_h * 2.0f * size_scale;
+        layer.size = {meters_w, meters_h};
+
+        glm_matrix[3] -= glm_matrix[2] * distance; // Place in front of camera
+        glm_matrix[3] += m_parent->m_slate_x_offset->value() * glm_matrix[0];
+        glm_matrix[3] += m_parent->m_slate_y_offset->value() * glm_matrix[1];
+        glm_matrix[3].w = 1.0f;
+
+        // Per-eye HUD depth offset (only when called with LEFT or RIGHT visibility)
+        // Shifts overlay position per eye to create stereoscopic parallax.
+        // Positive depth = into world (uncrossed disparity)
+        // Negative = popout (crossed disparity)
+        if (eye != XR_EYE_VISIBILITY_BOTH) {
+            const float eye_sign = (eye == XR_EYE_VISIBILITY_LEFT) ? -1.0f : 1.0f;
+            const float half_w = meters_w * 0.5f;
+
+            const float stereo_depth     = ms.stereo_depth_safe();
+            const float convergence      = ms.convergence_safe();
+            const float hud_depth_target = ms.hud_depth_target_safe(); // EMA-smoothed per-mode depth
+
+            // Single formula: per-mode slider value drives HUD parallax
+            // scale=2.0 maps slider ±1.0 to approx scene convergence magnitude
+            const float scale = 2.0f;
+            float final_ndc = stereo_depth * hud_depth_target * scale / convergence;
+            // Clamp to avoid extreme parallax
+            if (final_ndc < -0.2f) final_ndc = -0.2f;
+            if (final_ndc > 0.2f) final_ndc = 0.2f;
+
+            // Convert NDC shift to meters, normalized by distance so HUD 3D Depth
+            // gives consistent parallax regardless of UI Distance slider.
+            // half_w scales with distance, so dividing by distance gives a fixed
+            // reference width (the overlay's half-width at 1 meter).
+            const float ref_half_w = half_w / std::max(0.1f, distance);
+            const float offset_meters = eye_sign * final_ndc * ref_half_w;
+            glm_matrix[3] += offset_meters * glm_matrix[0]; // Offset along camera right vector
+
+            static bool overlay_hud_logged = false;
+            if (!overlay_hud_logged) {
+                spdlog::info("[UE3D] Overlay HUD: per-eye depth active "
+                    "(ndc={:.4f}, target={:.2f}, eye={})",
+                    final_ndc, hud_depth_target, (eye == XR_EYE_VISIBILITY_LEFT) ? 0 : 1);
+                overlay_hud_logged = true;
+            }
+        }
     } else {
-        auto rotation_offset = glm::inverse(vr->get_rotation_offset());
+        // ---- VR mode: original overlay positioning ----
+        if (vr->m_overlay_component.m_ui_follows_view->value()) {
+            layer.space = vr->m_openxr->view_space;
+        } else {
+            auto rotation_offset = glm::inverse(vr->get_rotation_offset());
 
-        if (vr->is_decoupled_pitch_enabled() && vr->is_decoupled_pitch_ui_adjust_enabled()) {
-            const auto pre_flat_rotation = vr->get_pre_flattened_rotation();
-            const auto pre_flat_pitch = utility::math::pitch_only(pre_flat_rotation);
+            if (vr->is_decoupled_pitch_enabled() && vr->is_decoupled_pitch_ui_adjust_enabled()) {
+                const auto pre_flat_rotation = vr->get_pre_flattened_rotation();
+                const auto pre_flat_pitch = utility::math::pitch_only(pre_flat_rotation);
 
-            // Add the inverse of the pitch rotation to the rotation offset
-            rotation_offset = glm::normalize(glm::inverse(pre_flat_pitch * vr->get_rotation_offset()));
+                // Add the inverse of the pitch rotation to the rotation offset
+                rotation_offset = glm::normalize(glm::inverse(pre_flat_pitch * vr->get_rotation_offset()));
+            }
+
+            glm_matrix = Matrix4x4f{rotation_offset};
+            glm_matrix[3] += vr->get_standing_origin();
+            layer.space = vr->m_openxr->stage_space;
         }
 
-        glm_matrix = Matrix4x4f{rotation_offset};   
-        glm_matrix[3] += vr->get_standing_origin();
-        layer.space = vr->m_openxr->stage_space;
+        const auto size_meters = m_parent->m_slate_size->value();
+        meters_w = (float)ui_swapchain.width / (float)ui_swapchain.height * size_meters;
+        meters_h = size_meters;
+        layer.size = {meters_w, meters_h};
+
+        glm_matrix[3] -= glm_matrix[2] * m_parent->m_slate_distance->value();
+        glm_matrix[3] += m_parent->m_slate_x_offset->value() * glm_matrix[0];
+        glm_matrix[3] += m_parent->m_slate_y_offset->value() * glm_matrix[1];
+        glm_matrix[3].w = 1.0f;
     }
-
-    const auto size_meters = m_parent->m_slate_size->value();
-    const auto meters_w = (float)ui_swapchain.width / (float)ui_swapchain.height * size_meters;
-    const auto meters_h = size_meters;
-    layer.size = {meters_w, meters_h};
-
-    glm_matrix[3] -= glm_matrix[2] * m_parent->m_slate_distance->value();
-    glm_matrix[3] += m_parent->m_slate_x_offset->value() * glm_matrix[0];
-    glm_matrix[3] += m_parent->m_slate_y_offset->value() * glm_matrix[1];
-    glm_matrix[3].w = 1.0f;
 
     layer.pose.orientation = runtimes::OpenXR::to_openxr(glm::quat_cast(glm_matrix));
     layer.pose.position = runtimes::OpenXR::to_openxr(glm_matrix[3]);

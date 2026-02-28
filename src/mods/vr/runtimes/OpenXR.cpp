@@ -17,6 +17,9 @@
 
 #include "../../VR.hpp"
 #include "OpenXR.hpp"
+#include "../GameFOV.hpp"
+#include "../ue3d/UE3D_MonitorState.hpp"
+#include <cstring>  // for memcmp
 
 using namespace nlohmann;
 
@@ -554,20 +557,64 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
     };
 
     // if we've not yet derived an eye projection matrix, or we've changed the projection, derive it here
-    // Hacky way to check for an uninitialised eye matrix - is there something better, is this necessary?
+    // === ASXCVBN'S VRTO3D CONVERGENCE FIX (PR #372) ===
+    // Detect if VRto3D changed the HMD FOV (convergence hotkeys)
+    bool fov_changed = false;
+    if (!m_fov_initialized) {
+        m_fov_initialized = true;
+        fov_changed = true;
+    } else {
+        if (std::memcmp(&this->views[0].fov, &m_last_fovs[0], sizeof(XrFovf)) != 0 ||
+            std::memcmp(&this->views[1].fov, &m_last_fovs[1], sizeof(XrFovf)) != 0) {
+            fov_changed = true;
+        }
+    }
+    m_last_fovs[0] = this->views[0].fov;
+    m_last_fovs[1] = this->views[1].fov;
+
+    // === GAME FOV PASSTHROUGH (SCOPE ZOOM) ===
+    auto& game_fov = vrmod::GameFOV::get();
+    // Apply game FOV scaling for scope/ADS zoom (monitor mode needs this too — VRto3D provides fixed 90deg)
+    float fov_scale = game_fov.get_fov_scale();
+
+    // Force recalculation if FOV changed (VRto3D convergence) or fov_scale changed (zoom enter OR exit)
+    if (fov_changed || fov_scale != m_game_fov_scale) {
+        this->should_recalculate_eye_projections = true;
+    }
+    m_game_fov_scale = fov_scale;
+
+    // if we've not yet derived an eye projection matrix, or we've changed the projection, derive it here
     if (this->should_recalculate_eye_projections || this->last_eye_matrix_nearz != nearz || this->projections[0][2][3] == 0) {
-        // deriving the texture bounds when modifying projections requires left and right raw projections so get them all before we start:
         std::unique_lock __{this->eyes_mtx};
-        const auto& left_fov = this->views[0].fov;
+
+        // Get base FOV from views
+        XrFovf left_fov = this->views[0].fov;
+        XrFovf right_fov = this->views[1].fov;
+
+        // Apply game FOV scaling for scope zoom
+        if (fov_scale < 1.0f) {
+            left_fov.angleLeft *= fov_scale;
+            left_fov.angleRight *= fov_scale;
+            left_fov.angleUp *= fov_scale;
+            left_fov.angleDown *= fov_scale;
+
+            right_fov.angleLeft *= fov_scale;
+            right_fov.angleRight *= fov_scale;
+            right_fov.angleUp *= fov_scale;
+            right_fov.angleDown *= fov_scale;
+        }
+
+        // Calculate raw projections with (potentially scaled) FOV
         this->raw_projections[0][0] = tan(left_fov.angleLeft);
         this->raw_projections[0][1] = tan(left_fov.angleRight);
         this->raw_projections[0][2] = tan(left_fov.angleUp);
         this->raw_projections[0][3] = tan(left_fov.angleDown);
-        const auto& right_fov = this->views[1].fov;
+
         this->raw_projections[1][0] = tan(right_fov.angleLeft);
         this->raw_projections[1][1] = tan(right_fov.angleRight);
         this->raw_projections[1][2] = tan(right_fov.angleUp);
         this->raw_projections[1][3] = tan(right_fov.angleDown);
+
         this->projections[0] = get_mat(0);
         this->projections[1] = get_mat(1);
         this->should_recalculate_eye_projections = false;

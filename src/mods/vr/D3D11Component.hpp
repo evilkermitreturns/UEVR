@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <openvr.h>
@@ -32,6 +33,11 @@ public:
     auto& openxr() { return m_openxr; }
 
     auto& get_ui_tex() { return m_ui_tex; }
+
+    // Depth readback for auto world-scale (monitor mode)
+    float get_center_depth_value() const {
+        return m_center_depth_value.load(std::memory_order_relaxed);
+    }
 
     bool clear_tex(ID3D11Resource* rsrc, std::optional<DXGI_FORMAT> format = std::nullopt);
     bool clear_tex(ID3D11Resource* rsrc, float* color, std::optional<DXGI_FORMAT> format = std::nullopt);
@@ -175,6 +181,14 @@ private:
     bool m_submitted_left_eye{false};
     bool m_is_shader_setup{false};
     bool m_last_afr_state{false};
+
+    // Depth readback for auto world-scale (monitor mode)
+    ComPtr<ID3D11Texture2D> m_depth_staging_tex{};
+    uint32_t m_depth_staging_width{0};
+    uint32_t m_depth_staging_height{0};
+    std::atomic<float> m_center_depth_value{0.0f};
+    DXGI_FORMAT m_depth_format{DXGI_FORMAT_UNKNOWN};
+    uint32_t m_depth_readback_skip{0};
 
     struct OpenXR {
         OpenXR(D3D11Component* p) : parent(p) {}
