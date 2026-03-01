@@ -680,14 +680,19 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    } else { // Copy the left eye on AFR
-                        src_box.left = 0;
-                        src_box.right = m_backbuffer_size[0] / 2;
+                    } else { // Copy the left eye on AFR (monitor mode: right half for right eye)
+                        if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+                            src_box.left = m_backbuffer_size[0] / 2;
+                            src_box.right = m_backbuffer_size[0];
+                        } else {
+                            src_box.left = 0;
+                            src_box.right = m_backbuffer_size[0] / 2;
+                        }
                         src_box.top = 0;
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    }   
+                    }
                 } else {
                     src_box.left = 0;
                     src_box.right = m_backbuffer_size[0];
@@ -752,7 +757,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     m_openvr.copy_left_to_right(m_scene_capture_tex.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
                 }
             } else {
-                m_openvr.copy_left_to_right(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+                // Monitor mode: right eye renders to right half of SBS texture
+                if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+                    m_openvr.copy_right(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+                } else {
+                    m_openvr.copy_left_to_right(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+                }
             }
 
             vr::D3D12TextureData_t right {

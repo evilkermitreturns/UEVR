@@ -711,14 +711,19 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    } else { // Copy the left eye on AFR
-                        src_box.left = 0;
-                        src_box.right = m_backbuffer_size[0] / 2;
+                    } else { // Copy the left eye on AFR (monitor mode: right half for right eye)
+                        if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+                            src_box.left = m_backbuffer_size[0] / 2;
+                            src_box.right = m_backbuffer_size[0];
+                        } else {
+                            src_box.left = 0;
+                            src_box.right = m_backbuffer_size[0] / 2;
+                        }
                         src_box.top = 0;
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    }   
+                    }
                 } else {
                     src_box.left = 0;
                     src_box.right = m_backbuffer_size[0];
@@ -869,14 +874,19 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    } else { // Copy the left eye on AFR
-                        src_box.left = 0;
-                        src_box.right = m_backbuffer_size[0] / 2;
+                    } else { // Copy the left eye on AFR (monitor mode: right half for right eye)
+                        if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+                            src_box.left = m_backbuffer_size[0] / 2;
+                            src_box.right = m_backbuffer_size[0];
+                        } else {
+                            src_box.left = 0;
+                            src_box.right = m_backbuffer_size[0] / 2;
+                        }
                         src_box.top = 0;
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    }   
+                    }
                 } else {
                     src_box.left = 0;
                     src_box.right = m_backbuffer_size[0];

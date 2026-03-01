@@ -2411,6 +2411,14 @@ void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewport
                     return;
                 }
 
+                // Monitor mode: advance frame count so the second synced sequential draw renders the opposite eye.
+                // g_frame_count is only set in game_viewport_client_draw_hook, which hasn't fired yet when
+                // GameThreadWorker runs. Without this, both draws use the same eye index (always LEFT).
+                // VR mode: leave unchanged — compositor retains last valid per-eye submission, works fine as-is.
+                if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+                    ++g_frame_count;
+                }
+
                 const auto viewport_draw = (void (*)(void*, bool))g_hook->m_viewport_draw_hook.target();
                 viewport_draw(viewport, true);
 
@@ -3017,6 +3025,30 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     const auto true_index = vr->is_using_afr() ? (g_frame_count + last_index) % 2 : last_index;
 
+    // Ghosting fix: track and swap scene states before monitor mode early return.
+    // The scene state swap modifies init_options before sceneview_monitor_mode calls the constructor hook.
+    if (is_ue3d_monitor && vr->is_ghosting_fix_enabled() && vr->is_using_afr()) {
+        bool new_scene_state_inserted = false;
+
+        if (init_options_scene_state != nullptr && !known_scene_states.contains(init_options_scene_state)) {
+            SPDLOG_INFO("Inserting new scene state {:x}", (uintptr_t)init_options_scene_state);
+            known_scene_states.insert(init_options_scene_state);
+            new_scene_state_inserted = true;
+        }
+
+        if (init_options_scene_state != nullptr && !new_scene_state_inserted &&
+            !known_scene_states.empty() && true_index == 1) {
+            init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
+            for (auto scene_state : known_scene_states) {
+                if (scene_state != init_options_scene_state) {
+                    SPDLOG_INFO_ONCE("Setting scene state to {:x}", (uintptr_t)scene_state);
+                    init_options->set_scene_state(scene_state);
+                    break;
+                }
+            }
+        }
+    }
+
     // Monitor mode: FOV extraction + UE5 crash guard (early return)
     if (is_ue3d_monitor) {
         return sceneview_monitor_mode(view, init_options, init_options_ue5, a3, a4, is_ue5, last_index,
@@ -3261,7 +3293,11 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     auto& vr = VR::get();
     auto rtm = g_hook->get_render_target_manager();
 
-    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+    // Skip scene capture path if nothing is driving stereo OR native fix is disabled.
+    // Monitor mode with native fix enabled falls through to the scene capture rendering path
+    // (fixes games like E33 where one eye renders garbage without the scene capture swap).
+    const bool is_monitor = ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed);
+    if ((!vr->is_hmd_active() && !is_monitor) || !vr->is_native_stereo_fix_enabled()) {
         rtm->destroy_scene_capture();
 
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
@@ -4703,7 +4739,14 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
             true_index = g_frame_count % 2;
         }
 
-        *x = half_w * true_index;
+        // When native stereo fix is active, don't apply SBS offset — each eye
+        // renders to its own target (scene capture swap handles separation).
+        // Matches VR path behavior at line 4725.
+        if (!vr->is_native_stereo_fix_enabled()) {
+            *x = half_w * true_index;
+        } else {
+            *x = 0;
+        }
         *y = 0;
         *w = half_w;
         *h = eye_h;
@@ -5479,8 +5522,18 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
         return 2;
     }
 
-    // Monitor mode view count
-    if (is_stereo_enabled && ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+    // Monitor mode view count — when native stereo fix is enabled, fall through to the
+    // scene capture readiness check below so begin_render_viewfamily_real can use it.
+    if (is_stereo_enabled && ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)
+        && !vr->is_native_stereo_fix_enabled()) {
+        // Ghosting fix: temporarily return 2 to discover second scene state
+        if (vr->is_ghosting_fix_enabled() && vr->is_using_afr() &&
+            g_hook->m_sceneview_data.known_scene_states.size() < 2 &&
+            g_hook->m_fixed_localplayer_view_count &&
+            !!g_hook->m_sceneview_data.constructor_hook &&
+            g_hook->m_has_view_extensions_installed) {
+            return 2;
+        }
         return (vr->is_using_afr() && !vr->is_splitscreen_compatibility_enabled()) ? 1 : 2;
     }
 

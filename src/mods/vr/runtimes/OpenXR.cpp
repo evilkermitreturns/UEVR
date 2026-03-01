@@ -1859,7 +1859,19 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             int32_t offset_x = 0, offset_y = 0, extent_x = 0, extent_y = 0;
             // if we're working with a double-wide texture, use half the view bounds adjustment (as they apply to a single eye)
             int texture_area_width = is_afr ? swapchain->width : swapchain->width / 2;
-            if (is_afr || i == 0) {
+            const bool is_monitor = ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed);
+            if (is_monitor) {
+                // Monitor mode: full uncropped rectangle — symmetric frustum, no view_bounds crop needed
+                if (is_afr || i == 0) {
+                    offset_x = 0;
+                    extent_x = texture_area_width;
+                } else {
+                    offset_x = texture_area_width;
+                    extent_x = texture_area_width;
+                }
+                offset_y = 0;
+                extent_y = swapchain->height;
+            } else if (is_afr || i == 0) {
                 offset_x = view_bounds[i][0] * texture_area_width;
                 extent_x = view_bounds[i][1] * texture_area_width - offset_x;
             } else {
@@ -1867,8 +1879,10 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
                 offset_x = texture_area_width + view_bounds[i][0] * texture_area_width;
                 extent_x = view_bounds[i][1] * texture_area_width - (offset_x - texture_area_width);
             }
-            offset_y = view_bounds[i][2] * swapchain->height;
-            extent_y = view_bounds[i][3] * swapchain->height - offset_y;
+            if (!is_monitor) {
+                offset_y = view_bounds[i][2] * swapchain->height;
+                extent_y = view_bounds[i][3] * swapchain->height - offset_y;
+            }
             
             // SPDLOG_INFO("image calc for eye {} {}, {}, {}, {}", i, offset_x, extent_x, offset_y, extent_y);
             projection_layer_views[i].subImage.imageRect.offset = {offset_x, offset_y};
