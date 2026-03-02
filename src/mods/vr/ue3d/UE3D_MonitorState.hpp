@@ -84,6 +84,24 @@ struct MonitorState {
     // cached world_scale for convergence symmetry (written by view_offset, read by projection)
     std::atomic<float> fCachedWorldScale{100.0f};
 
+    // debug diagnostics
+    std::atomic<bool> bForceFlat{false};                   // force zero stereo (eye offset=0, convergence=0)
+    std::atomic<uint32_t> uViewOffsetCalls{0};             // calls to calculate_stereo_view_offset this frame
+    std::atomic<uint32_t> uProjectionCalls{0};             // calls to calculate_stereo_projection_matrix this frame
+    std::atomic<uint32_t> uSlateHookCalls{0};              // calls to slate_draw_window_render_thread this frame
+    std::atomic<uint32_t> uCanvasHookCalls{0};             // calls to init_canvas this frame
+    std::atomic<uint32_t> uDebugFrameCount{0};             // frame counter for resetting per-frame stats
+    // RSSetViewports viewport hook was removed — both PointerHook (vtable mismatch on DX12)
+    // and safetyhook inline (access violation in DX12 thunk) approaches failed. See lessons #126.
+
+    // snapshot values (latched once per frame for UI display)
+    std::atomic<uint32_t> uViewOffsetCallsSnapshot{0};
+    std::atomic<uint32_t> uProjectionCallsSnapshot{0};
+    std::atomic<uint32_t> uSlateHookCallsSnapshot{0};
+    std::atomic<uint32_t> uCanvasHookCallsSnapshot{0};
+    std::atomic<float> fLastEyeOffset{0.0f};               // last applied eye offset (world units)
+    std::atomic<float> fLastConvergenceShift{0.0f};         // last applied [2][0] convergence shift
+
     // safe reads with NaN/infinity guards
     float stereo_depth_safe(float fallback = constants::DEFAULT_STEREO_DEPTH) const {
         float v = fStereoDepth.load(std::memory_order_relaxed);

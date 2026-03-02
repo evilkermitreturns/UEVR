@@ -4823,6 +4823,23 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // but with symmetric math (parallel cameras, no HMD rotation).
     auto& ms = ue3d::MonitorState::get();
     if (ms.bMonitorMode.load(std::memory_order_relaxed) && !is_full_pass) {
+        // Debug: snapshot and reset per-frame counters on new frame
+        const uint32_t current_frame = g_frame_count;
+        if (ms.uDebugFrameCount.load(std::memory_order_relaxed) != current_frame) {
+            ms.uDebugFrameCount.store(current_frame, std::memory_order_relaxed);
+            ms.uViewOffsetCallsSnapshot.store(ms.uViewOffsetCalls.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ms.uProjectionCallsSnapshot.store(ms.uProjectionCalls.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ms.uSlateHookCallsSnapshot.store(ms.uSlateHookCalls.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ms.uCanvasHookCallsSnapshot.store(ms.uCanvasHookCalls.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ms.uViewOffsetCalls.store(0, std::memory_order_relaxed);
+            ms.uProjectionCalls.store(0, std::memory_order_relaxed);
+            ms.uSlateHookCalls.store(0, std::memory_order_relaxed);
+            ms.uCanvasHookCalls.store(0, std::memory_order_relaxed);
+        }
+
+        // Debug: per-frame call counter
+        ms.uViewOffsetCalls.fetch_add(1, std::memory_order_relaxed);
+
         // SS fix: use g_frame_count for ALL AFR modes (matches VR path).
         // With synced sequential, view_index is always 0 (1 view per draw),
         // but g_frame_count increments between the two FViewport::Draw invocations.
@@ -4837,6 +4854,12 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         } else {
             if (has_double_precision) { *rot_d = g_hook->m_last_afr_rotation_double; }
             else { *view_rotation = g_hook->m_last_afr_rotation; }
+        }
+
+        // Force Flat debug: zero all eye separation
+        if (ms.bForceFlat.load(std::memory_order_relaxed)) {
+            ms.fLastEyeOffset.store(0.0f, std::memory_order_relaxed);
+            return;
         }
 
         // Eye separation using view rotation's right vector
@@ -4878,6 +4901,8 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             loc_d->z += (double)(eye_offset * right_z);
         }
 
+        // Debug: record last applied offset
+        ms.fLastEyeOffset.store(eye_offset, std::memory_order_relaxed);
         return;
     }
 
@@ -5280,26 +5305,43 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         }
 
         // Monitor mode: convergence shift (modify-fall-through, needs VR projection first)
+        // Convergence shift operates in clip/projection space (NDC) — scale-independent.
+        // world_scale belongs in eye separation only (world-space camera positioning).
+        // SteamVR's OpenXR layer adds IPD-based asymmetry to [2][0] even when VRto3D
+        // provides symmetric projection — use = (not +=) to replace it with our value.
         auto& ms = ue3d::MonitorState::get();
         if (view_index != -1 && ms.bMonitorMode.load(std::memory_order_relaxed)) {
-            const float stereo_depth = ms.stereo_depth_safe();
-            const float convergence = ms.convergence_safe();
-            const float dyn_conv = ms.dyn_conv_safe();
-            const float strength = ms.strength_safe();
-            const float world_scale = ms.world_scale_safe();
+            // Debug: per-frame call counter
+            ms.uProjectionCalls.fetch_add(1, std::memory_order_relaxed);
 
-            // SS fix: true_index from g_frame_count%2 IS correct for synced sequential.
-            // g_frame_count increments between the two FViewport::Draw invocations,
-            // and view_index is always 0 with SS (1 view per draw). No override needed.
-            const float eye_sign = (true_index == 0) ? -1.0f : 1.0f;
-
-            float shift = eye_sign * stereo_depth * dyn_conv * strength * world_scale * 0.5f / convergence;
-            shift = std::max(-ue3d::constants::CONVERGENCE_SHIFT_CLAMP, std::min(ue3d::constants::CONVERGENCE_SHIFT_CLAMP, shift));
-
-            if (!g_hook->m_has_double_precision) {
-                (*out)[2][0] += shift;
+            // Force Flat debug: zero convergence shift (also replace SteamVR asymmetry)
+            if (ms.bForceFlat.load(std::memory_order_relaxed)) {
+                if (!g_hook->m_has_double_precision) {
+                    (*out)[2][0] = 0.0f;
+                } else {
+                    double_matrix[2][0] = 0.0;
+                }
+                ms.fLastConvergenceShift.store(0.0f, std::memory_order_relaxed);
             } else {
-                double_matrix[2][0] += (double)shift;
+                const float stereo_depth = ms.stereo_depth_safe();
+                const float convergence = ms.convergence_safe();
+                const float dyn_conv = ms.dyn_conv_safe();
+                const float strength = ms.strength_safe();
+
+                // SS fix: true_index from g_frame_count%2 IS correct for synced sequential.
+                // g_frame_count increments between the two FViewport::Draw invocations,
+                // and view_index is always 0 with SS (1 view per draw). No override needed.
+                const float eye_sign = (true_index == 0) ? -1.0f : 1.0f;
+
+                const float shift = eye_sign * stereo_depth * dyn_conv * strength * 0.5f / convergence;
+
+                if (!g_hook->m_has_double_precision) {
+                    (*out)[2][0] = shift;
+                } else {
+                    double_matrix[2][0] = (double)shift;
+                }
+
+                ms.fLastConvergenceShift.store(shift, std::memory_order_relaxed);
             }
         }
     } else {
@@ -5403,6 +5445,9 @@ void FFakeStereoRenderingHook::init_canvas(FFakeStereoRendering* stereo, sdk::FS
 #else
     SPDLOG_INFO_ONCE("init canvas called!");
 #endif
+
+    // Debug: per-frame Canvas hook call counter
+    ue3d::MonitorState::get().uCanvasHookCalls.fetch_add(1, std::memory_order_relaxed);
 
     if (!g_framework->is_game_data_intialized()) {
         return;
@@ -6008,6 +6053,9 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
     SPDLOG_INFO_ONCE("SlateRHIRenderer::DrawWindow_RenderThread called!");
 #endif
 
+    // Debug: per-frame Slate hook call counter
+    ue3d::MonitorState::get().uSlateHookCalls.fetch_add(1, std::memory_order_relaxed);
+
     if (!g_framework->is_game_data_intialized() || a2 == nullptr) {
         return g_hook->m_slate_thread_hook.call<void*>(renderer, a2, a3, a4, params, unk1, unk2);
     }
@@ -6253,7 +6301,7 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
     for (auto& mod : mods) {
         mod->on_post_slate_draw_window(renderer, a2, viewport_info);
     }
-    
+
     // After this we copy over the texture and clear it in the present hook. doing it here just seems to crash sometimes.
     SPDLOG_INFO_ONCE("SlateRHIRenderer::DrawWindow_RenderThread finished!");
 

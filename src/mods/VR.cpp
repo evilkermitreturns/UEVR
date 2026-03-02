@@ -2014,6 +2014,7 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
         if (auto v = cfg.get<bool>("ue3d_canvas_hud_hook")) {
             ms.bCanvasHUDHook.store(*v, std::memory_order_relaxed);
         }
+        // ue3d_viewport_hud_fix removed — RSSetViewports hooking crashed on DX12
         if (auto v = cfg.get<float>("ue3d_ads_str_mult")) {
             if (std::isfinite(*v) && *v >= -2.0f && *v <= 100.0f) {
                 vrmod::GameFOV::get().config().ads_strength_mult = *v;
@@ -2102,6 +2103,7 @@ void VR::on_config_save(utility::Config& cfg) {
         cfg.set<float>("ue3d_cutscene_hud_size", ms.fCutsceneHUDSize.load(std::memory_order_relaxed));
         cfg.set<bool>("ue3d_hud_auto_size", ms.bHUDAutoSize.load(std::memory_order_relaxed));
         cfg.set<bool>("ue3d_canvas_hud_hook", ms.bCanvasHUDHook.load(std::memory_order_relaxed));
+        // ue3d_viewport_hud_fix removed — RSSetViewports hooking crashed on DX12
         cfg.set<float>("ue3d_ads_str_mult", vrmod::GameFOV::get().config().ads_strength_mult);
         cfg.set<float>("ue3d_scope_str_mult", vrmod::GameFOV::get().config().scope_strength_mult);
         cfg.set<float>("ue3d_cut_str_mult", vrmod::GameFOV::get().config().cutscene_strength_mult);
@@ -3167,6 +3169,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::TextDisabled("FOV tracking, zoom thresholds, transition speeds");
                 ImGui::Spacing();
 
+                // Viewport HUD Fix removed — RSSetViewports hooking crashed on DX12 runtimes
+                // (PointerHook: different vtable instances, safetyhook inline: access violation in thunk).
+                // See lessons-detailed.md #126 for details.
+
                 {
                     const char* fov_mode_items[] = {"Auto", "Manual"};
                     int fov_mode_idx = static_cast<int>(cfg.fov_mode);
@@ -3330,6 +3336,37 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::Text("  FOV Adjust:  %.3f deg", st.vrto3d_fov_adjustment);
                 ImGui::Text("  Profile:     %s", st.vrto3d_profile_loaded ? "loaded" : "none");
                 ImGui::Text("  Auto-Depth:  %s", st.vrto3d_auto_depth ? "ON" : "off");
+
+                // ─── Debug Diagnostics (visible when Debug checkbox is on) ───
+                if (cfg.debug_logging) {
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Debug Diagnostics:");
+
+                    // Force Flat toggle — zeros ALL stereo output for isolation testing
+                    bool force_flat = ms.bForceFlat.load(std::memory_order_relaxed);
+                    if (ImGui::Checkbox("Force Flat (zero all stereo)", &force_flat)) {
+                        ms.bForceFlat.store(force_flat, std::memory_order_relaxed);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Forces eye offset=0 and convergence=0.\n"
+                            "If HUD elements still show separation with this ON,\n"
+                            "the separation comes from outside UEVR's stereo hooks.");
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Text("Per-Frame Hook Calls:");
+                    ImGui::Text("  ViewOffset:  %u", ms.uViewOffsetCallsSnapshot.load(std::memory_order_relaxed));
+                    ImGui::Text("  Projection:  %u", ms.uProjectionCallsSnapshot.load(std::memory_order_relaxed));
+                    ImGui::Text("  Slate Hook:  %u", ms.uSlateHookCallsSnapshot.load(std::memory_order_relaxed));
+                    ImGui::Text("  Canvas Hook: %u", ms.uCanvasHookCallsSnapshot.load(std::memory_order_relaxed));
+
+                    ImGui::Spacing();
+                    ImGui::Text("Last Applied Stereo:");
+                    ImGui::Text("  Eye Offset:  %.4f UE units", ms.fLastEyeOffset.load(std::memory_order_relaxed));
+                    ImGui::Text("  Conv Shift:  %.6f NDC", ms.fLastConvergenceShift.load(std::memory_order_relaxed));
+                    ImGui::Text("  3D Strength: %.2f", ms.strength_safe());
+                }
 
                 ImGui::TreePop();
             }
