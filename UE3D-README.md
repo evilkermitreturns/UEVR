@@ -103,8 +103,6 @@ Live telemetry — FOV readings, zoom state, depth engine, VRto3D bridge connect
 
 ## Known Limitations
 
-- **16:9 only** — no ultrawide 3D monitors exist yet
-- **SteamVR required** — the pipeline goes through SteamVR even though there's no headset
 - **Shader compatibility** — some UE4/5 games have stereo rendering issues. Same limitations as base UEVR.
 - **AHUD games** — games using Unreal's AHUD class (Bloodstained, Asterigos, Sinking City, Styx) bypass the HUD depth system. 3D still works, HUD depth won't.
 - **Depth buffer (experimental)** — crashes most UE5 games. Behind an opt-in toggle.

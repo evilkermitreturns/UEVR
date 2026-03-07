@@ -51,29 +51,29 @@ struct MonitorState {
     std::atomic<float> fIPD_mm{63.0f};
     std::atomic<float> fViewingDistance_cm{65.0f};
 
-    // aim input for depth classification (two-source OR: mouse || gamepad)
-    std::atomic<bool> bIsAiming{false};       // combined result (read by classify_depth_mode)
-    std::atomic<bool> bMouseAiming{false};    // set by on_message (WM_RBUTTONDOWN/UP)
-    std::atomic<bool> bGamepadAiming{false};  // set by on_xinput_get_state (LT)
+    // aim input (two-source: mouse RMB + gamepad LT)
+    std::atomic<bool> bIsAiming{false};
+    std::atomic<bool> bMouseAiming{false};
+    std::atomic<bool> bGamepadAiming{false};
 
     // user controls
-    std::atomic<float> fGlobalDepthFloor{0.0f};            // 0 = full flatten allowed, 1 = always full 3D
-    std::atomic<float> f3DStrength{1.0f};                  // 0-2, default 1 (100%)
+    std::atomic<float> fGlobalDepthFloor{0.0f};
+    std::atomic<float> f3DStrength{1.0f};
 
-    // HUD depth — per-mode sliders (all [-2.0 to +2.0], 0=flat)
-    std::atomic<float> fHUDDepthScale{0.0f};               // Normal mode HUD depth
-    std::atomic<float> fADSHUDDepth{0.0f};                 // ADS mode HUD depth
-    std::atomic<float> fScopeHUDDepth{0.0f};               // Scope mode HUD depth
-    std::atomic<float> fCutsceneHUDDepth{0.0f};            // Cutscene mode HUD depth
-    std::atomic<float> fHUDDepthTarget{0.0f};              // computed: EMA-smoothed per-mode depth (written by GameFOV)
+    // HUD depth — per-mode sliders [-2, +2], 0=flat
+    std::atomic<float> fHUDDepthScale{0.0f};
+    std::atomic<float> fADSHUDDepth{0.0f};
+    std::atomic<float> fScopeHUDDepth{0.0f};
+    std::atomic<float> fCutsceneHUDDepth{0.0f};
+    std::atomic<float> fHUDDepthTarget{0.0f};              // EMA-smoothed target (written by GameFOV)
 
-    // HUD size — per-mode multipliers on base UI Size (all [0.5 to 2.0], 1.0=neutral)
-    std::atomic<float> fNormalHUDSize{1.0f};               // Normal mode HUD size multiplier
-    std::atomic<float> fADSHUDSize{1.0f};                  // ADS mode HUD size multiplier
-    std::atomic<float> fScopeHUDSize{1.0f};                // Scope mode HUD size multiplier
-    std::atomic<float> fCutsceneHUDSize{1.0f};             // Cutscene mode HUD size multiplier
-    std::atomic<float> fHUDSizeTarget{1.0f};               // computed: EMA-smoothed per-mode size (written by GameFOV)
-    std::atomic<bool> bHUDAutoSize{false};                  // experimental: auto-scale based on depth distance
+    // HUD size — per-mode multipliers on base UI Size [0.5, 2.0]
+    std::atomic<float> fNormalHUDSize{1.0f};
+    std::atomic<float> fADSHUDSize{1.0f};
+    std::atomic<float> fScopeHUDSize{1.0f};
+    std::atomic<float> fCutsceneHUDSize{1.0f};
+    std::atomic<float> fHUDSizeTarget{1.0f};               // EMA-smoothed target (written by GameFOV)
+    std::atomic<bool> bHUDAutoSize{false};
 
     // HUD hooks
     std::atomic<bool> bCanvasHUDHook{false};               // enable init_canvas hook (off by default, may crash some games)
@@ -85,22 +85,20 @@ struct MonitorState {
     std::atomic<float> fCachedWorldScale{100.0f};
 
     // debug diagnostics
-    std::atomic<bool> bForceFlat{false};                   // force zero stereo (eye offset=0, convergence=0)
-    std::atomic<uint32_t> uViewOffsetCalls{0};             // calls to calculate_stereo_view_offset this frame
-    std::atomic<uint32_t> uProjectionCalls{0};             // calls to calculate_stereo_projection_matrix this frame
-    std::atomic<uint32_t> uSlateHookCalls{0};              // calls to slate_draw_window_render_thread this frame
-    std::atomic<uint32_t> uCanvasHookCalls{0};             // calls to init_canvas this frame
-    std::atomic<uint32_t> uDebugFrameCount{0};             // frame counter for resetting per-frame stats
-    // RSSetViewports viewport hook was removed — both PointerHook (vtable mismatch on DX12)
-    // and safetyhook inline (access violation in DX12 thunk) approaches failed. See lessons #126.
+    std::atomic<bool> bForceFlat{false};
+    std::atomic<uint32_t> uViewOffsetCalls{0};
+    std::atomic<uint32_t> uProjectionCalls{0};
+    std::atomic<uint32_t> uSlateHookCalls{0};
+    std::atomic<uint32_t> uCanvasHookCalls{0};
+    std::atomic<uint32_t> uDebugFrameCount{0};
 
-    // snapshot values (latched once per frame for UI display)
+    // snapshot values (latched once per frame for UI)
     std::atomic<uint32_t> uViewOffsetCallsSnapshot{0};
     std::atomic<uint32_t> uProjectionCallsSnapshot{0};
     std::atomic<uint32_t> uSlateHookCallsSnapshot{0};
     std::atomic<uint32_t> uCanvasHookCallsSnapshot{0};
-    std::atomic<float> fLastEyeOffset{0.0f};               // last applied eye offset (world units)
-    std::atomic<float> fLastConvergenceShift{0.0f};         // last applied [2][0] convergence shift
+    std::atomic<float> fLastEyeOffset{0.0f};
+    std::atomic<float> fLastConvergenceShift{0.0f};
 
     // safe reads with NaN/infinity guards
     float stereo_depth_safe(float fallback = constants::DEFAULT_STEREO_DEPTH) const {

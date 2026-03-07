@@ -208,11 +208,11 @@ public:
     std::unordered_map<uint32_t, Swapchain> swapchains{}; // SwapchainIndex -> Swapchain
     std::vector<XrView> views{};
     std::vector<XrView> stage_views{};
-    // === ASXCVBN'S VRTO3D CONVERGENCE FIX (PR #372) ===
+    // VRto3D convergence fix (PR #372)
    std::array<XrFovf, 2> m_last_fovs{};
    bool m_fov_initialized{false};
 
-   // === GAME FOV PASSTHROUGH (SCOPE ZOOM) ===
+   // Game FOV passthrough (scope zoom)
    float m_game_fov_scale{1.0f};
 
     //std::deque<std::vector<XrView>> stage_view_queue{};

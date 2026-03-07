@@ -369,7 +369,7 @@ void OverlayComponent::update_slate_openvr() {
 
     auto glm_matrix = glm::identity<glm::mat4>();
 
-    // ---- Monitor mode: identity-relative overlay positioning ----
+    // Monitor mode
     if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
         auto& ms = ue3d::MonitorState::get();
         const float hud_mult = ms.hud_depth_mult_safe();
@@ -394,7 +394,7 @@ void OverlayComponent::update_slate_openvr() {
         const auto width_meters = half_h * aspect * 2.0f * size_scale;
         vr::VROverlay()->SetOverlayWidthInMeters(m_slate_overlay_handle, width_meters);
     } else {
-        // ---- VR mode: original overlay positioning ----
+        // VR mode
         vr::TrackedDevicePose_t pose{};
         vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, &pose, 1);
 
@@ -896,7 +896,7 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     float meters_w = 0.0f;
     float meters_h = 0.0f;
 
-    // ---- Monitor mode: camera-relative overlay pinned to convergence distance ----
+    // Monitor mode
     if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
         auto& ms = ue3d::MonitorState::get();
         layer.space = vr->m_openxr->view_space; // Camera-relative (VRto3D reports identity pose)
@@ -959,7 +959,7 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
             }
         }
     } else {
-        // ---- VR mode: original overlay positioning ----
+        // VR mode
         if (vr->m_overlay_component.m_ui_follows_view->value()) {
             layer.space = vr->m_openxr->view_space;
         } else {

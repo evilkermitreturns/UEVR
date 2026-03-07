@@ -2723,9 +2723,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::TreePop();
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // PAGE: Monitor 3D — own sidebar tab, setup-flow order
-    // ═══════════════════════════════════════════════════════════════
+    // Monitor 3D page
     if (selected_page == PAGE_MONITOR) {
         auto& ms = ue3d::MonitorState::get();
         auto& gfov = vrmod::GameFOV::get();
@@ -2743,7 +2741,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             bridge.init();
         }
 
-        // ─── HEADER: Enable + Connection + Debug + Live Status ───
+        // Header
         bool monitor_mode = ms.bMonitorMode.load(std::memory_order_relaxed);
         if (ImGui::Checkbox("Enable Monitor Mode", &monitor_mode)) {
             ms.bMonitorMode.store(monitor_mode, std::memory_order_relaxed);
@@ -2811,7 +2809,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         if (monitor_mode) {
 
-            // ─── 1. DISPLAY SETUP ───
+            // Display setup
             ImGui::Separator();
             ImGui::TextDisabled("Display Setup");
 
@@ -2842,7 +2840,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ms.fViewingDistance_cm.store(dist, std::memory_order_relaxed);
             }
 
-            // ─── 2. 3D CALIBRATION ───
+            // 3D calibration
             ImGui::Separator();
             ImGui::TextDisabled("3D Calibration");
 
@@ -2895,7 +2893,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::SetTooltip("Send depth multiplier to VRto3D for matching depth control.\nLocal stereo flattening during zoom is always active.");
             }
 
-            // ─── 3. AUTO-DEPTH ───
+            // Auto-depth
             ImGui::Separator();
             ImGui::TextDisabled("Auto-Depth");
 
@@ -2938,7 +2936,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::SetTooltip("Floor for auto-depth flattening.\n0%% = full flatten, 100%% = always full 3D.");
             }
 
-            // ─── 4. AIM ALIGNMENT ───
+            // Aim alignment
             if (st.vrto3d_connected) {
                 ImGui::Separator();
                 ImGui::TextDisabled("Aim Alignment");
@@ -2960,7 +2958,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Reset to 0"); }
             }
 
-            // ─── 5. HUD (collapsible) ───
+            // HUD
             if (ImGui::TreeNode("HUD Depth & Size")) {
                 // Normal mode
                 {
@@ -3078,7 +3076,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::TreePop();
             }
 
-            // ─── 6. DEPTH TUNING (collapsible) ───
+            // Depth tuning
             if (ImGui::TreeNode("Depth Tuning")) {
                 ImGui::TextDisabled("Fine-tune flattening behavior during zoom");
                 ImGui::Spacing();
@@ -3164,7 +3162,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::TreePop();
             }
 
-            // ─── 7. EXPERT (collapsible) ───
+            // Expert
             if (ImGui::TreeNode("Expert")) {
                 ImGui::TextDisabled("FOV tracking, zoom thresholds, transition speeds");
                 ImGui::Spacing();
@@ -3293,7 +3291,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::TreePop();
             }
 
-            // ─── 8. STATUS (collapsible) ───
+            // Status
             if (ImGui::TreeNode("Status")) {
                 ImGui::Text("Stereo: %.4f  Conv: %.2f", ms.stereo_depth_safe(), ms.convergence_safe());
                 ImGui::Text("Mode: %s  Aim: %s",
@@ -3337,7 +3335,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::Text("  Profile:     %s", st.vrto3d_profile_loaded ? "loaded" : "none");
                 ImGui::Text("  Auto-Depth:  %s", st.vrto3d_auto_depth ? "ON" : "off");
 
-                // ─── Debug Diagnostics (visible when Debug checkbox is on) ───
+                // Debug diagnostics
                 if (cfg.debug_logging) {
                     ImGui::Spacing();
                     ImGui::Separator();

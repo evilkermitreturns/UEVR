@@ -1,19 +1,28 @@
 /*
- * uevr_vrto3d_protocol.h - Shared Memory Protocol Definition
- * 
- * VERSION: 3.3
+ * ue3d_protocol.h - UE3D Shared Memory Protocol Definition
  *
- * SINGLE SOURCE OF TRUTH for the shared memory layout between UEVR and VRto3D.
- * Both projects should include this EXACT file to prevent struct misalignment.
+ * VERSION: 4.0
  *
- * UEVR includes this as:  #include "uevr_vrto3d_protocol.h"
- * VRto3D includes this as: #include "uevr_vrto3d_protocol.h"
+ * SINGLE SOURCE OF TRUTH for 3-party shared memory (UEVR + VRto3D + 3DGameBridge).
+ * All projects should include this EXACT file to prevent struct misalignment.
+ *
+ * UEVR includes local copy:      #include "ue3d_protocol.h"
+ * VRto3D includes canonical:     #include "vrto3dlib/ue3d_protocol.h"
+ * 3DGameBridge includes local:   #include "ue3d_protocol.h"
  *
  * LICENSE: This file is dual-licensed to be compatible with both:
  *   - UEVR (MIT License)
  *   - VRto3D (LGPL v3)
  *
  * CHANGELOG:
+ *   v4.0 - Repurposed dead mod_* fields (48 bytes at offset 184) for Leia integration
+ *        - Eye tracking: 6 eye position floats + tracking flag + frame counter (32 bytes)
+ *        - Display info: physical width/height from SR::Display for auto calibration (8 bytes)
+ *        - Added UE3D_FLAG_LEIA_EYES feature flag
+ *        - Fields written by 3DGameBridge (Path 1), read by UEVR via VRto3DBridge
+ *        - Wire-compatible with v3: old readers see has_modifiers=0 (ignored)
+ *        - Leia coordinates: origin=display center, X=right, Y=up, Z=backward (mm)
+ *        - Renamed from UEVR_VRto3D_* to UE3D_* (3-party naming)
  *   v3.3 - Added stereo_depth_hint field (4 bytes from reserved)
  *        - UEVR writes its stereo_depth so VRto3D can match overlay IPD to game
  *        - Wire-compatible with v3.2: new field occupies previously-zeroed area
@@ -22,7 +31,7 @@
  *        - VRto3D sets is_monitor_display=1 when outputting to monitor (not HMD)
  *        - Wire-compatible with v3.1: new fields occupy previously-zeroed area
  *   v3.1 - Added profile modifier fields (48 bytes from reserved)
- *        - Added UEVR_FLAG_MODIFIERS feature flag
+ *        - Added UE3D_FLAG_MODIFIERS feature flag
  *        - Reserved shrinks from 72 to 24 bytes
  *        - Wire-compatible with v3.0: modifiers occupy previously-zeroed area
  *        - Fixed _pad1 alignment (was 1 byte, now 5 bytes)
@@ -31,8 +40,8 @@
  *   v2.0 - Absolute values (deprecated)
  */
 
-#ifndef UEVR_VRTO3D_PROTOCOL_H
-#define UEVR_VRTO3D_PROTOCOL_H
+#ifndef UE3D_PROTOCOL_H
+#define UE3D_PROTOCOL_H
 
 #include <cstdint>
 
@@ -40,45 +49,46 @@
 /* PROTOCOL CONSTANTS                                                         */
 /* ========================================================================== */
 
-#define UEVR_VRTO3D_MAGIC          0x55455652   /* "UEVR" in ASCII            */
-#define UEVR_VRTO3D_VERSION        3            /* Protocol version           */
-#define UEVR_VRTO3D_STRUCT_SIZE    256          /* Total struct size in bytes  */
-#define UEVR_VRTO3D_SHMEM_NAME    "UEVR_VRto3D_SharedData"
+#define UE3D_MAGIC          0x55455652   /* "UEVR" in ASCII (unchanged)        */
+#define UE3D_VERSION        4            /* Protocol version                   */
+#define UE3D_STRUCT_SIZE    256          /* Total struct size in bytes          */
+#define UE3D_SHMEM_NAME    "UE3D_SharedData"
 
 /* Staleness threshold: data older than this (ms) is considered disconnected  */
-#define UEVR_VRTO3D_STALE_MS       1000
+#define UE3D_STALE_MS       1000
 
 /* Feature flags (bitfield in SharedData.flags)                               */
-#define UEVR_FLAG_MULTIPLIER_MODE  0x01   /* Uses multipliers, not absolutes  */
-#define UEVR_FLAG_SCENE_AWARE      0x02   /* Sends scene_type field           */
-#define UEVR_FLAG_FOV_COMP         0x04   /* Supports FOV compensation        */
-#define UEVR_FLAG_MODIFIERS        0x08   /* v3.1: Profile modifier fields    */
-#define UEVR_FLAG_AIM_CORRECTION   0x10   /* v3.2: stereo_aim_correction field */
+#define UE3D_FLAG_MULTIPLIER_MODE  0x01   /* Uses multipliers, not absolutes  */
+#define UE3D_FLAG_SCENE_AWARE      0x02   /* Sends scene_type field           */
+#define UE3D_FLAG_FOV_COMP         0x04   /* Supports FOV compensation        */
+#define UE3D_FLAG_MODIFIERS        0x08   /* v3.1: (deprecated, repurposed as LEIA_EYES in v4.0) */
+#define UE3D_FLAG_AIM_CORRECTION   0x10   /* v3.2: stereo_aim_correction field */
+#define UE3D_FLAG_LEIA_EYES        0x20   /* v4.0: Leia eye tracking + display fields */
 
 /* ========================================================================== */
 /* ENUMS                                                                       */
 /* ========================================================================== */
 
 /* Scene type - tells VRto3D what context UEVR is in */
-enum UEVR_SceneType : uint8_t {
-    UEVR_SCENE_NORMAL   = 0,
-    UEVR_SCENE_CUTSCENE = 1,
-    UEVR_SCENE_MENU     = 2,
-    UEVR_SCENE_VEHICLE  = 3,
-    UEVR_SCENE_LOADING  = 4
+enum UE3D_SceneType : uint8_t {
+    UE3D_SCENE_NORMAL   = 0,
+    UE3D_SCENE_CUTSCENE = 1,
+    UE3D_SCENE_MENU     = 2,
+    UE3D_SCENE_VEHICLE  = 3,
+    UE3D_SCENE_LOADING  = 4
 };
 
 /* Zoom mode - tells VRto3D what kind of zoom UEVR detected */
-enum UEVR_ZoomMode : uint8_t {
-    UEVR_ZOOM_NONE           = 0,
-    UEVR_ZOOM_AIM_DOWN_SIGHT = 1,
-    UEVR_ZOOM_SCOPE          = 2
+enum UE3D_ZoomMode : uint8_t {
+    UE3D_ZOOM_NONE           = 0,
+    UE3D_ZOOM_AIM_DOWN_SIGHT = 1,
+    UE3D_ZOOM_SCOPE          = 2
 };
 
 /* ========================================================================== */
 /* SHARED MEMORY STRUCTURE - 256 BYTES, PACKED                                 */
 /*                                                                             */
-/* BOTH SIDES MUST USE THIS EXACT LAYOUT.                                      */
+/* ALL PARTIES MUST USE THIS EXACT LAYOUT.                                     */
 /*                                                                             */
 /* Offset map:                                                                 */
 /*   0-15    HEADER             (16 bytes)                                     */
@@ -88,21 +98,46 @@ enum UEVR_ZoomMode : uint8_t {
 /*   72-103  VRTO3D STATE       (32 bytes)  VRto3D -> UEVR                    */
 /*   104-119 VRTO3D STATUS      (16 bytes)  VRto3D -> UEVR                    */
 /*   120-183 PROFILE INFO       (64 bytes)  UEVR -> VRto3D                    */
-/*   184-231 PROFILE MODIFIERS  (48 bytes)  VRto3D -> UEVR  [v3.1]           */
+/*   184-215 LEIA EYE TRACKING  (32 bytes)  3DGameBridge -> UEVR  [v4.0]     */
+/*   216-223 LEIA DISPLAY INFO  (8 bytes)   3DGameBridge -> UEVR  [v4.0]     */
+/*   224-231 LEIA RESERVED      (8 bytes)   Future Leia fields                */
 /*   232-243 AIM + COMMANDS     (12 bytes)  UEVR -> VRto3D  [v3.2]           */
 /*   244-245 MONITOR MODE       (2 bytes)   Bidirectional   [v3.2]           */
 /*   246-249 STEREO DEPTH HINT  (4 bytes)   UEVR -> VRto3D  [v3.3]           */
 /*   250-255 RESERVED           (6 bytes)   Future use                         */
+/*                                                                             */
+/* MONITOR MODE FIELD STATUS (for cleanup reference):                          */
+/*                                                                             */
+/* ALIVE (system breaks without):                                              */
+/*   monitor_mode, is_monitor_display, stereo_depth_hint,                      */
+/*   fov_scale, zoom_mode, depth_multiplier, scene_type, world_scale,          */
+/*   vrto3d_connected, auto_depth_request, command_seq,                        */
+/*   magic, version, struct_size, flags, is_valid, timestamps                  */
+/*                                                                             */
+/* ALIVE (Leia -- Path 1, written by 3DGameBridge, read by UEVR):             */
+/*   leia_tracking_active, leia_left_eye_x/y/z, leia_right_eye_x/y/z,         */
+/*   leia_frame_counter, leia_display_width_cm, leia_display_height_cm         */
+/*                                                                             */
+/* DEAD IN MONITOR MODE (UEVR handles internally):                             */
+/*   game_fov, base_fov (VRto3D doesn't act on these)                          */
+/*   convergence_multiplier (always 1.0, UEVR owns convergence)                */
+/*   stereo_aim_correction, stereo_aim_base (VR-only feature)                  */
+/*   uevr_frametime (never consumed)                                           */
+/*   is_zooming (VRto3D derives from fov_scale < 0.99)                         */
+/*                                                                             */
+/* DIAGNOSTIC ONLY (read for UI display, no logic depends on them):            */
+/*   vrto3d_depth, vrto3d_convergence, vrto3d_fov, vrto3d_fov_adjustment,      */
+/*   vrto3d_aspect_ratio, vrto3d_ipd, vrto3d_hmd_height, vrto3d_sbs_mode      */
 /* ========================================================================== */
 
 #pragma pack(push, 1)
-typedef struct UEVR_VRto3D_SharedData {
+typedef struct UE3D_SharedData {
 
     /* ----- HEADER (16 bytes) -------------------------------------------- */
-    uint32_t magic;                  /* Must be UEVR_VRTO3D_MAGIC            */
-    uint32_t version;                /* UEVR_VRTO3D_VERSION                  */
-    uint32_t struct_size;            /* sizeof(UEVR_VRto3D_SharedData) = 256 */
-    uint32_t flags;                  /* Bitfield: UEVR_FLAG_*                */
+    uint32_t magic;                  /* Must be UE3D_MAGIC                   */
+    uint32_t version;                /* UE3D_VERSION                         */
+    uint32_t struct_size;            /* sizeof(UE3D_SharedData) = 256        */
+    uint32_t flags;                  /* Bitfield: UE3D_FLAG_*                */
 
     /* ----- UEVR -> VRTO3D: FOV / ZOOM (24 bytes) ----------------------- */
     float    game_fov;               /* Game camera FOV in degrees           */
@@ -111,13 +146,13 @@ typedef struct UEVR_VRto3D_SharedData {
     float    zoom_factor;            /* Magnification (2.0 = 2x zoom)       */
     uint8_t  is_zooming;             /* 1 if zoom is active                  */
     uint8_t  is_valid;               /* 1 if FOV reading is trustworthy      */
-    uint8_t  zoom_mode;              /* UEVR_ZoomMode enum                   */
+    uint8_t  zoom_mode;              /* UE3D_ZoomMode enum                   */
     uint8_t  _pad1[5];              /* Align to 24 bytes for this section   */
 
     /* ----- UEVR -> VRTO3D: DEPTH CONTROL (16 bytes) -------------------- */
     float    depth_multiplier;       /* 0.05 - 1.0 (1.0 = no change)        */
     float    convergence_multiplier; /* Reserved, usually 1.0                */
-    uint8_t  scene_type;             /* UEVR_SceneType enum                  */
+    uint8_t  scene_type;             /* UE3D_SceneType enum                  */
     uint8_t  auto_depth_request;     /* 1 if UEVR wants auto-depth applied   */
     uint8_t  _pad2[2];              /* Padding                              */
     float    world_scale;            /* UEVR world scale                     */
@@ -150,26 +185,39 @@ typedef struct UEVR_VRto3D_SharedData {
     char     uevr_profile_name[32];  /* Current UEVR profile name            */
     char     game_exe_name[32];      /* Game executable name                 */
 
-    /* ----- v3.1: PROFILE MODIFIERS (48 bytes) VRto3D -> UEVR ----------- */
+    /* ----- v4.0: LEIA EYE TRACKING (32 bytes) 3DGameBridge -> UEVR ------ */
     /*                                                                       */
-    /* Written by VRto3D when a game profile has "uevr_modifiers" section.   */
-    /* All float fields use 0.0 as sentinel for "not overridden."            */
-    /* v3.0 peers see zeroes here and ignore them safely.                    */
-    /* Check (flags & UEVR_FLAG_MODIFIERS) && has_modifiers before reading.  */
+    /* Eye positions from LeiaSR SDK, written by 3DGameBridge (Path 1).      */
+    /* Coordinates: Leia space (origin=display center, mm).                  */
+    /*   X = right, Y = up, Z = backward (positive away from user).         */
+    /* UE conversion: FVector(-Z, X, Y), divide mm by 10 for cm.            */
+    /* Both eyes provided; consumer averages for center-eye head offset.     */
+    /* v3.x peers see has_modifiers=0 (leia_tracking_active=0 on init),     */
+    /* so mod fields read as "not overridden" -- backward compatible.        */
+    /* Guard: (flags & UE3D_FLAG_LEIA_EYES) && leia_tracking_active.        */
     /*                                                                       */
-    uint8_t  has_modifiers;          /* 1 if profile has uevr_modifiers      */
-    uint8_t  _pad5[3];              /* Alignment padding                    */
-    float    mod_depth_strength;     /* Override depth curve strength         */
-    float    mod_depth_min_floor;    /* Override global minimum depth         */
-    float    mod_ads_floor;          /* Override ADS depth floor              */
-    float    mod_scope_floor;        /* Override scope depth floor            */
-    float    mod_cutscene_floor;     /* Override cutscene depth floor         */
-    float    mod_base_power;         /* Override depth base power exponent    */
-    float    mod_extra_power;        /* Override depth extra power            */
-    float    mod_dead_zone;          /* Override dead zone zoom factor        */
-    float    mod_transition_speed;   /* Override smoothing speed multiplier   */
-    float    mod_zoom_threshold;     /* Override zoom detection threshold     */
-    float    mod_base_fov_override;  /* Override base FOV (0 = auto-detect)  */
+    uint8_t  leia_tracking_active;   /* 1 if face tracked, 0 if not         */
+    uint8_t  _leia_pad1[3];          /* Alignment padding                   */
+    float    leia_left_eye_x;        /* Left eye X (mm, right)              */
+    float    leia_left_eye_y;        /* Left eye Y (mm, up)                 */
+    float    leia_left_eye_z;        /* Left eye Z (mm, backward)           */
+    float    leia_right_eye_x;       /* Right eye X (mm, right)             */
+    float    leia_right_eye_y;       /* Right eye Y (mm, up)                */
+    float    leia_right_eye_z;       /* Right eye Z (mm, backward)          */
+    uint32_t leia_frame_counter;     /* Writer increments each update       */
+
+    /* ----- v4.0: LEIA DISPLAY INFO (8 bytes) 3DGameBridge -> UEVR ------- */
+    /*                                                                       */
+    /* Physical display dimensions from SR::Display class.                   */
+    /* Enables automatic stereo calibration: stereo_depth = IPD / width.     */
+    /* Replaces UE3D_MonitorDetect EDID heuristic with exact hardware data.  */
+    /* 0.0 = not provided (non-Leia display or 3DGameBridge not running).    */
+    /*                                                                       */
+    float    leia_display_width_cm;  /* Physical display width (cm)         */
+    float    leia_display_height_cm; /* Physical display height (cm)        */
+
+    /* ----- v4.0: RESERVED FOR LEIA (8 bytes) ---------------------------- */
+    uint8_t  _leia_reserved[8];      /* Zero-filled, future Leia fields     */
 
     /* ----- v3.2: AIM CORRECTION + COMMANDS (12 bytes) UEVR -> VRto3D ---- */
     float    stereo_aim_correction;  /* Zoom-scaled lateral aim correction    */
@@ -198,16 +246,16 @@ typedef struct UEVR_VRto3D_SharedData {
     /* ----- RESERVED (6 bytes) ------------------------------------------- */
     uint8_t  reserved[6];            /* Zero-filled, for future fields       */
 
-} UEVR_VRto3D_SharedData;
+} UE3D_SharedData;
 #pragma pack(pop)
 
 /* Compile-time size check - if this fires, the struct layout is wrong */
 #ifndef __cplusplus
-_Static_assert(sizeof(UEVR_VRto3D_SharedData) == 256,
-    "UEVR_VRto3D_SharedData must be exactly 256 bytes");
+_Static_assert(sizeof(UE3D_SharedData) == 256,
+    "UE3D_SharedData must be exactly 256 bytes");
 #else
-static_assert(sizeof(UEVR_VRto3D_SharedData) == 256,
-    "UEVR_VRto3D_SharedData must be exactly 256 bytes");
+static_assert(sizeof(UE3D_SharedData) == 256,
+    "UE3D_SharedData must be exactly 256 bytes");
 #endif
 
 /* ========================================================================== */
@@ -215,23 +263,23 @@ static_assert(sizeof(UEVR_VRto3D_SharedData) == 256,
 /* ========================================================================== */
 
 /* Check if UEVR data is fresh */
-static inline int uevr_vrto3d_is_uevr_fresh(const UEVR_VRto3D_SharedData* d, uint64_t now_ms) {
-    if (!d || d->magic != UEVR_VRTO3D_MAGIC) return 0;
+static inline int ue3d_is_uevr_fresh(const UE3D_SharedData* d, uint64_t now_ms) {
+    if (!d || d->magic != UE3D_MAGIC) return 0;
     if (!d->is_valid) return 0;
-    return (now_ms - d->uevr_timestamp) < UEVR_VRTO3D_STALE_MS;
+    return (now_ms - d->uevr_timestamp) < UE3D_STALE_MS;
 }
 
 /* Check if VRto3D data is fresh */
-static inline int uevr_vrto3d_is_vrto3d_fresh(const UEVR_VRto3D_SharedData* d, uint64_t now_ms) {
-    if (!d || d->magic != UEVR_VRTO3D_MAGIC) return 0;
+static inline int ue3d_is_vrto3d_fresh(const UE3D_SharedData* d, uint64_t now_ms) {
+    if (!d || d->magic != UE3D_MAGIC) return 0;
     if (!d->vrto3d_connected) return 0;
-    return (now_ms - d->vrto3d_timestamp) < UEVR_VRTO3D_STALE_MS;
+    return (now_ms - d->vrto3d_timestamp) < UE3D_STALE_MS;
 }
 
-/* Check if profile modifiers are present (v3.1) */
-static inline int uevr_vrto3d_has_modifiers(const UEVR_VRto3D_SharedData* d) {
+/* Check if Leia eye tracking data is present (v4.0) */
+static inline int ue3d_has_leia_eyes(const UE3D_SharedData* d) {
     if (!d) return 0;
-    return (d->flags & UEVR_FLAG_MODIFIERS) && d->has_modifiers;
+    return (d->flags & UE3D_FLAG_LEIA_EYES) && d->leia_tracking_active;
 }
 
-#endif /* UEVR_VRTO3D_PROTOCOL_H */
+#endif /* UE3D_PROTOCOL_H */

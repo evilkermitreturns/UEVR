@@ -557,8 +557,7 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
     };
 
     // if we've not yet derived an eye projection matrix, or we've changed the projection, derive it here
-    // === ASXCVBN'S VRTO3D CONVERGENCE FIX (PR #372) ===
-    // Detect if VRto3D changed the HMD FOV (convergence hotkeys)
+    // VRto3D convergence fix (PR #372) — detect if VRto3D changed the HMD FOV
     bool fov_changed = false;
     if (!m_fov_initialized) {
         m_fov_initialized = true;
@@ -572,12 +571,11 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
     m_last_fovs[0] = this->views[0].fov;
     m_last_fovs[1] = this->views[1].fov;
 
-    // === GAME FOV PASSTHROUGH (SCOPE ZOOM) ===
+    // Game FOV passthrough (scope zoom)
     auto& game_fov = vrmod::GameFOV::get();
-    // Apply game FOV scaling for scope/ADS zoom (monitor mode needs this too — VRto3D provides fixed 90deg)
     float fov_scale = game_fov.get_fov_scale();
 
-    // Force recalculation if FOV changed (VRto3D convergence) or fov_scale changed (zoom enter OR exit)
+    // Recalculate if FOV changed (VRto3D convergence) or fov_scale changed (zoom enter/exit)
     if (fov_changed || fov_scale != m_game_fov_scale) {
         this->should_recalculate_eye_projections = true;
     }

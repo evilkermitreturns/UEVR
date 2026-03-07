@@ -291,10 +291,8 @@ private:
     // Names of modifiers the canary confirmed ALIVE — event-managed, never promote to baseline
     std::unordered_set<std::wstring> m_canary_alive_names;
 
-    // ──── Canary Probe: Orphaned Modifier Detection ────
-    // Directly tests whether the game is actively writing to a camera modifier's Alpha.
-    // Set bDisabled=true (blocks UE's UpdateAlpha interp), write canary Alpha, wait 3 frames.
-    // If Alpha restored → ALIVE (game actively managing). If canary persists → ORPHANED → neutralize.
+    // Canary probe: tests if game writes to modifier Alpha.
+    // bDisabled + perturb Alpha, wait 3 frames. Restored = ALIVE, persists = ORPHANED.
 
     enum class ProbePhase : uint8_t {
         IDLE = 0,      // No non-baseline modifier present

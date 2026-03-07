@@ -72,7 +72,7 @@ void GameFOV::shutdown() {
 }
 
 void GameFOV::update() {
-    // Phase 1: Ensure initialized (needs exclusive lock for first-time init)
+    // Init if needed
     {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
         if (!m_initialized) {
@@ -80,7 +80,7 @@ void GameFOV::update() {
         }
     }
 
-    // Phase 2: Read game FOV WITHOUT lock (UESDK reflection is the expensive part)
+    // Read game FOV (no lock - reflection is expensive)
     float game_fov_reading = 0.0f;
     bool using_override = false;
     {
@@ -94,12 +94,10 @@ void GameFOV::update() {
         game_fov_reading = read_game_camera_fov();  // No lock needed
     }
 
-    // Phase 3: State mutation under exclusive lock
     {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
 
-        // --- Neutralization FOV override ---
-        // Clear on aim input FIRST (ADS cycles the camera, fixing stuck FOV naturally)
+        // Clear override on aim input
         if (m_neutralize_override_active && !using_override) {
             const bool aim_clear = ue3d::MonitorState::get().bIsAiming.load(std::memory_order_relaxed);
             if (aim_clear) {
@@ -108,9 +106,7 @@ void GameFOV::update() {
                 debug_log("FOV OVERRIDE: Cleared by aim input (ADS will cycle camera)");
             }
         }
-        // Replace stuck reading with base_fov, or auto-clear if game recovered.
-        // Uses signed fov_diff (not abs) to match zoom exit logic: game FOV wider
-        // than base gives negative diff, which is always < threshold = "not zoomed".
+        // Auto-clear if game FOV recovered
         if (m_neutralize_override_active && !using_override) {
             float fov_diff = m_config.base_fov - game_fov_reading;
             if (game_fov_reading > 0.0f
@@ -190,26 +186,18 @@ void GameFOV::update() {
         }
         if (m_state.fov_valid) m_state.auto_calibrated = true;
 
-        // Post-menu recalibration: if gameplay FOV stabilizes to something different from
-        // base_fov (e.g., 59.8 vs 54.4 from cinematic camera at menu), update base_fov.
-        // Fires once per level, requires 60 frames (~1s) of stable non-zoom gameplay.
-        // Four-layer guard prevents capturing uninitialized camera values (Bug 8).
+        // Recalibrate base FOV if gameplay differs (once per level, four-layer guard)
         if (m_state.auto_calibrated && !m_recalibrated_this_level
             && m_state.fov_valid && m_state.game_fov > 0.0f
             && m_state.depth_mode == DepthMode::None
             && m_state.player_pawn_valid
             && !ue3d::MonitorState::get().bIsAiming.load(std::memory_order_relaxed)
             && std::abs(m_state.game_fov - m_config.base_fov) > 3.0f
-            // Layer 1: Wait 5s after level transition (camera needs time to initialize)
             && m_transition_holdoff_timer >= TRANSITION_HOLDOFF_SECS
-            // Layer 2: FOV must have varied (uninitialized camera returns constant DefaultFOV)
             && m_fov_has_varied_since_transition
-            // Layer 4: Sanity range — reject extreme values
             && m_state.game_fov >= 40.0f && m_state.game_fov <= 130.0f) {
 
-            // Layer 3: Reject values near APlayerCameraManager::DefaultFOV (90deg)
-            // During load, GetFOVAngle() returns DefaultFOV before game camera runs.
-            // Read the property dynamically — games can override it.
+            // Reject values near DefaultFOV (returned before game camera runs)
             bool rejected_by_default_fov = false;
             auto* camera_manager = get_camera_manager();
             if (camera_manager) {
@@ -321,18 +309,15 @@ void GameFOV::update() {
         }
     }
 
-    // Phase 4: Bridge update outside main lock (bridge has its own mutex)
-    // Safe because only the game thread calls update() and writes m_state/m_config
+    // Bridge update (bridge has its own mutex)
     update_vrto3d_bridge();
 
-    // Phase 5: Write to MonitorState atomics (monitor mode only)
+    // Write to MonitorState atomics (monitor mode only)
     auto& ms = ue3d::MonitorState::get();
     if (ms.bMonitorMode.load(std::memory_order_relaxed)) {
         ms.fDynDepthMult.store(m_state.current_depth_multiplier, std::memory_order_relaxed);
 
-        // Convergence tracks depth uniformly (fixed blend 0.70).
-        // Per-mode differentiation handled upstream by per-mode strength
-        // multipliers (which change depth_mult itself — convergence follows).
+        // Convergence follows depth via fixed blend (0.70)
         const float conv_mult = std::pow(m_state.current_depth_multiplier, 0.70f);
         ms.fDynConvMult.store(conv_mult, std::memory_order_relaxed);
 
@@ -460,9 +445,7 @@ float GameFOV::read_game_camera_fov() {
         struct { float ReturnValue; } params{};
         camera_manager->process_event(get_fov_func, &params);
 
-        // ──── Canary Probe state machine ────
-        // Tests whether the game is actively writing to a non-baseline modifier's Alpha.
-        // ORPHANED verdict → neutralize (Alpha=0, bDisabled, one-shot FOV stomp, signal override).
+        // Canary probe state machine
         {
             // Resolve ModifierList property (one-time, cached for lifetime)
             static sdk::FProperty* s_probe_mod_prop = nullptr;

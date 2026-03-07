@@ -2411,10 +2411,7 @@ void FFakeStereoRenderingHook::game_viewport_client_draw_hook(sdk::UGameViewport
                     return;
                 }
 
-                // Monitor mode: advance frame count so the second synced sequential draw renders the opposite eye.
-                // g_frame_count is only set in game_viewport_client_draw_hook, which hasn't fired yet when
-                // GameThreadWorker runs. Without this, both draws use the same eye index (always LEFT).
-                // VR mode: leave unchanged — compositor retains last valid per-eye submission, works fine as-is.
+                // Monitor mode: advance frame for second eye
                 if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
                     ++g_frame_count;
                 }
@@ -4819,8 +4816,6 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     const auto rot_d = (Rotator<double>*)view_rotation;
 
     // Monitor mode: rotation lock + eye offset (early return)
-    // VR mode does rotation + eye offset in this callback. Monitor mode does the same
-    // but with symmetric math (parallel cameras, no HMD rotation).
     auto& ms = ue3d::MonitorState::get();
     if (ms.bMonitorMode.load(std::memory_order_relaxed) && !is_full_pass) {
         // Debug: snapshot and reset per-frame counters on new frame
@@ -5304,11 +5299,7 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             double_matrix = fmat;
         }
 
-        // Monitor mode: convergence shift (modify-fall-through, needs VR projection first)
-        // Convergence shift operates in clip/projection space (NDC) — scale-independent.
-        // world_scale belongs in eye separation only (world-space camera positioning).
-        // SteamVR's OpenXR layer adds IPD-based asymmetry to [2][0] even when VRto3D
-        // provides symmetric projection — use = (not +=) to replace it with our value.
+        // Monitor mode: convergence shift (use = not += to replace SteamVR's asymmetry)
         auto& ms = ue3d::MonitorState::get();
         if (view_index != -1 && ms.bMonitorMode.load(std::memory_order_relaxed)) {
             // Debug: per-frame call counter
@@ -5517,8 +5508,7 @@ void FFakeStereoRenderingHook::init_canvas(FFakeStereoRendering* stereo, sdk::FS
         }
     }
 
-    // Monitor mode: two-mode HUD depth via direct assignment to canvas VP[2][0]
-    // VR mode: original behavior (unconditional canvas VP copy, no depth modification)
+    // Monitor mode: HUD depth via canvas VP[2][0]
     auto& ms = ue3d::MonitorState::get();
     if (ms.bMonitorMode.load(std::memory_order_relaxed)) {
         // Copy scene ViewProjectionMatrix to canvas (provides base transform)
