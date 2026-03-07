@@ -3318,6 +3318,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             // LookAround (Leia eye tracking)
             if (ImGui::TreeNode("LookAround")) {
                 ImGui::TextDisabled("Head tracking parallax for Leia displays");
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Note: Enable after loading into the game, not at the start menu.");
                 ImGui::Spacing();
 
                 bool look_enabled = ms.bLeiaLookAroundEnabled.load(std::memory_order_relaxed);
