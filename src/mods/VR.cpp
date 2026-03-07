@@ -2051,6 +2051,10 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
             if (std::isfinite(*v) && *v >= 0.0f && *v <= 3.0f)
                 ms.fLeiaZDepthStrength.store(*v, std::memory_order_relaxed);
         }
+        if (auto v = cfg.get<float>("ue3d_leia_motion_parallax")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 3.0f)
+                ms.fLeiaMotionParallax.store(*v, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -2140,6 +2144,7 @@ void VR::on_config_save(utility::Config& cfg) {
         cfg.set<bool>("ue3d_leia_inv_y", ms.bLeiaInvertY.load(std::memory_order_relaxed));
         cfg.set<bool>("ue3d_leia_inv_z", ms.bLeiaInvertZ.load(std::memory_order_relaxed));
         cfg.set<float>("ue3d_leia_z_depth_strength", ms.fLeiaZDepthStrength.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_leia_motion_parallax", ms.fLeiaMotionParallax.load(std::memory_order_relaxed));
     }
 }
 
@@ -3388,15 +3393,25 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                         }
                     }
 
+                    // Motion parallax: near objects shift fast, far barely move
+                    float motion = ms.fLeiaMotionParallax.load(std::memory_order_relaxed);
+                    if (ImGui::SliderFloat("Motion Depth", &motion, 0.0f, 3.0f, "%.2f")) {
+                        if (std::isfinite(motion)) {
+                            ms.fLeiaMotionParallax.store(motion, std::memory_order_relaxed);
+                        }
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("Near fast, far slow");
+
                     if (axis_z) {
-                        float z_fov = ms.fLeiaZDepthStrength.load(std::memory_order_relaxed);
-                        if (ImGui::SliderFloat("Z FOV", &z_fov, 0.0f, 3.0f, "%.2f")) {
-                            if (std::isfinite(z_fov)) {
-                                ms.fLeiaZDepthStrength.store(z_fov, std::memory_order_relaxed);
+                        float z_depth = ms.fLeiaZDepthStrength.load(std::memory_order_relaxed);
+                        if (ImGui::SliderFloat("Z Depth", &z_depth, 0.0f, 3.0f, "%.2f")) {
+                            if (std::isfinite(z_depth)) {
+                                ms.fLeiaZDepthStrength.store(z_depth, std::memory_order_relaxed);
                             }
                         }
                         ImGui::SameLine();
-                        ImGui::TextDisabled("Lean in = wider view");
+                        ImGui::TextDisabled("FOV + stereo");
                     }
 
                     if (ImGui::Button("Recalibrate")) {

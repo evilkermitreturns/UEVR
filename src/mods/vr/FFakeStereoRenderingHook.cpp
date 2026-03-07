@@ -5367,16 +5367,53 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
                         double_matrix[2][1] += (double)parallax_v;
                     }
 
-                    // Kooima Z FOV modulation: M[0][0] scales with viewing distance
-                    // Lean forward (head_z > 0) = closer to window = wider FOV (smaller M[0][0])
-                    // Physical angular disparity also increases naturally — no stereo_depth scaling needed
+                    // Convergence depth (shared by motion parallax + Z stereo)
+                    const float eye_sep_abs = std::abs(ms.fLastEyeOffset.load(std::memory_order_relaxed));
+                    const float m00 = !g_hook->m_has_double_precision ? (*out)[0][0] : (float)double_matrix[0][0];
+                    const float shift_abs = std::abs(shift);
+                    const float z_conv = (eye_sep_abs > 0.001f && shift_abs > 0.0001f)
+                        ? eye_sep_abs * m00 / shift_abs : 400.0f;
+
+                    // Motion parallax: near objects shift fast, far barely move (SAME both eyes)
+                    // Uses center-eye (monocular depth cue). Pseudo-occlusion: near slides over far.
+                    const float center_h = ms.leia_head_x_safe();
+                    const float center_v = ms.leia_head_y_safe();
+                    const float motion_str = ms.leia_motion_parallax_safe();
+
+                    if (motion_str > 0.0f) {
+                        if (std::abs(center_h) > 0.01f) {
+                            const float motion_h = inv_x * center_h * sensitivity * motion_str / half_w;
+                            if (!g_hook->m_has_double_precision) {
+                                (*out)[3][0] += motion_h;
+                                (*out)[2][0] += -motion_h / z_conv;
+                            } else {
+                                double_matrix[3][0] += (double)motion_h;
+                                double_matrix[2][0] += (double)(-motion_h / z_conv);
+                            }
+                        }
+                        if (std::abs(center_v) > 0.01f) {
+                            const float motion_v = inv_y * center_v * sensitivity * motion_str / half_h;
+                            if (!g_hook->m_has_double_precision) {
+                                (*out)[3][1] += motion_v;
+                                (*out)[2][1] += -motion_v / z_conv;
+                            } else {
+                                double_matrix[3][1] += (double)motion_v;
+                                double_matrix[2][1] += (double)(-motion_v / z_conv);
+                            }
+                        }
+                    }
+
+                    // Z axis: FOV modulation + stereo depth scaling (combined)
+                    // FOV (same both eyes): lean forward = wider view
+                    // Stereo (opposite per eye via eye_sign): lean forward = depth redistribution
                     if (ms.bLeiaAxisZ.load(std::memory_order_relaxed)) {
                         const float head_z = ms.leia_head_z_safe();
-                        const float z_sens = ms.leia_z_depth_strength_safe();
+                        const float z_str = ms.leia_z_depth_strength_safe();
                         const float inv_z = ms.bLeiaInvertZ.load(std::memory_order_relaxed) ? -1.0f : 1.0f;
 
-                        if (z_sens > 0.0f && std::abs(head_z) > 0.01f) {
-                            float z_scale = 1.0f - (inv_z * head_z * z_sens / view_dist);
+                        if (z_str > 0.0f && std::abs(head_z) > 0.01f) {
+                            // FOV modulation
+                            float z_scale = 1.0f - (inv_z * head_z * z_str / view_dist);
                             z_scale = (z_scale < 0.80f) ? 0.80f : (z_scale > 1.25f) ? 1.25f : z_scale;
 
                             if (!g_hook->m_has_double_precision) {
@@ -5385,6 +5422,16 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
                             } else {
                                 double_matrix[0][0] *= (double)z_scale;
                                 double_matrix[1][1] *= (double)z_scale;
+                            }
+
+                            // Stereo depth scaling
+                            const float z_stereo = eye_sign * inv_z * head_z * sensitivity * z_str / view_dist;
+                            if (!g_hook->m_has_double_precision) {
+                                (*out)[3][0] += z_stereo;
+                                (*out)[2][0] += -z_stereo / z_conv;
+                            } else {
+                                double_matrix[3][0] += (double)z_stereo;
+                                double_matrix[2][0] += (double)(-z_stereo / z_conv);
                             }
                         }
                     }

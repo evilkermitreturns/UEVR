@@ -98,7 +98,8 @@ struct MonitorState {
     std::atomic<bool> bLeiaInvertX{false};               // flip X parallax direction
     std::atomic<bool> bLeiaInvertY{false};               // flip Y parallax direction
     std::atomic<bool> bLeiaInvertZ{false};               // flip Z depth direction
-    std::atomic<float> fLeiaZDepthStrength{1.0f};        // Z depth-dependent stereo scaling strength (0=off, 1.0=normal, 3.0=max)
+    std::atomic<float> fLeiaZDepthStrength{1.0f};        // Z: FOV modulation + stereo scaling (0=off, 1.0=normal, 3.0=max)
+    std::atomic<float> fLeiaMotionParallax{0.5f};        // motion parallax: near shifts fast, far slow (0=off, 3=max)
     std::atomic<uint32_t> uLeiaFrameCounter{0};          // frames with tracking data
     std::atomic<float> fLeiaDisplayWidthCm{0.0f};        // physical display width from SR::Display
     std::atomic<float> fLeiaDisplayHeightCm{0.0f};       // physical display height from SR::Display
@@ -141,6 +142,11 @@ struct MonitorState {
     float leia_z_depth_strength_safe() const {
         float v = fLeiaZDepthStrength.load(std::memory_order_relaxed);
         if (!std::isfinite(v)) return 1.0f;
+        return (v < 0.0f) ? 0.0f : (v > 3.0f) ? 3.0f : v;
+    }
+    float leia_motion_parallax_safe() const {
+        float v = fLeiaMotionParallax.load(std::memory_order_relaxed);
+        if (!std::isfinite(v)) return 0.5f;
         return (v < 0.0f) ? 0.0f : (v > 3.0f) ? 3.0f : v;
     }
     float leia_sensitivity_safe() const {
