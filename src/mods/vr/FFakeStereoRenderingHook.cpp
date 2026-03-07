@@ -5424,8 +5424,9 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
                                 double_matrix[1][1] *= (double)z_scale;
                             }
 
-                            // Stereo depth scaling
-                            const float z_stereo = eye_sign * inv_z * head_z * sensitivity * z_str / view_dist;
+                            // Stereo depth scaling (separate invert from FOV)
+                            const float inv_zs = ms.bLeiaInvertZStereo.load(std::memory_order_relaxed) ? -1.0f : 1.0f;
+                            const float z_stereo = eye_sign * inv_zs * head_z * sensitivity * z_str / view_dist;
                             if (!g_hook->m_has_double_precision) {
                                 (*out)[3][0] += z_stereo;
                                 (*out)[2][0] += -z_stereo / z_conv;

@@ -97,7 +97,8 @@ struct MonitorState {
     std::atomic<bool> bLeiaAxisZ{false};                 // enable depth parallax (experimental)
     std::atomic<bool> bLeiaInvertX{false};               // flip X parallax direction
     std::atomic<bool> bLeiaInvertY{false};               // flip Y parallax direction
-    std::atomic<bool> bLeiaInvertZ{false};               // flip Z depth direction
+    std::atomic<bool> bLeiaInvertZ{false};               // flip Z FOV direction
+    std::atomic<bool> bLeiaInvertZStereo{false};         // flip Z stereo depth direction (independent from FOV)
     std::atomic<float> fLeiaZDepthStrength{1.0f};        // Z: FOV modulation + stereo scaling (0=off, 1.0=normal, 3.0=max)
     std::atomic<float> fLeiaMotionParallax{0.5f};        // motion parallax: near shifts fast, far slow (0=off, 3=max)
     std::atomic<uint32_t> uLeiaFrameCounter{0};          // frames with tracking data

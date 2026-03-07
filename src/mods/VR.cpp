@@ -2047,6 +2047,7 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
         if (auto v = cfg.get<bool>("ue3d_leia_inv_x")) ms.bLeiaInvertX.store(*v, std::memory_order_relaxed);
         if (auto v = cfg.get<bool>("ue3d_leia_inv_y")) ms.bLeiaInvertY.store(*v, std::memory_order_relaxed);
         if (auto v = cfg.get<bool>("ue3d_leia_inv_z")) ms.bLeiaInvertZ.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_inv_z_stereo")) ms.bLeiaInvertZStereo.store(*v, std::memory_order_relaxed);
         if (auto v = cfg.get<float>("ue3d_leia_z_depth_strength")) {
             if (std::isfinite(*v) && *v >= 0.0f && *v <= 3.0f)
                 ms.fLeiaZDepthStrength.store(*v, std::memory_order_relaxed);
@@ -2143,6 +2144,7 @@ void VR::on_config_save(utility::Config& cfg) {
         cfg.set<bool>("ue3d_leia_inv_x", ms.bLeiaInvertX.load(std::memory_order_relaxed));
         cfg.set<bool>("ue3d_leia_inv_y", ms.bLeiaInvertY.load(std::memory_order_relaxed));
         cfg.set<bool>("ue3d_leia_inv_z", ms.bLeiaInvertZ.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_inv_z_stereo", ms.bLeiaInvertZStereo.load(std::memory_order_relaxed));
         cfg.set<float>("ue3d_leia_z_depth_strength", ms.fLeiaZDepthStrength.load(std::memory_order_relaxed));
         cfg.set<float>("ue3d_leia_motion_parallax", ms.fLeiaMotionParallax.load(std::memory_order_relaxed));
     }
@@ -3412,6 +3414,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                         }
                         ImGui::SameLine();
                         ImGui::TextDisabled("FOV + stereo");
+
+                        bool inv_zs = ms.bLeiaInvertZStereo.load(std::memory_order_relaxed);
+                        if (ImGui::Checkbox("Invert Z Stereo", &inv_zs)) {
+                            ms.bLeiaInvertZStereo.store(inv_zs, std::memory_order_relaxed);
+                        }
                     }
 
                     if (ImGui::Button("Recalibrate")) {
