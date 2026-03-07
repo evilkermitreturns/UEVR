@@ -5333,6 +5333,32 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
                 }
 
                 ms.fLastConvergenceShift.store(shift, std::memory_order_relaxed);
+
+                // Leia LookAround: frustum parallax from head position (I13: AFTER convergence, I14: SAME both eyes)
+                if (ms.bLeiaLookAroundEnabled.load(std::memory_order_relaxed) &&
+                    ms.bLeiaTracking.load(std::memory_order_relaxed) &&
+                    ms.uLeiaFrameCounter.load(std::memory_order_relaxed) > 0) {
+
+                    const float head_h = ms.leia_head_x_safe();  // horizontal offset (cm)
+                    const float head_v = ms.leia_head_y_safe();  // vertical offset (cm)
+                    const float sensitivity = ms.leia_sensitivity_safe();
+                    const float view_dist = ms.viewing_distance_safe();
+
+                    // Window effect: move head left -> see more right (negative sign)
+                    // Invert toggle: flips to track effect (move head left -> see more left)
+                    const float sign = ms.bLeiaLookInvert.load(std::memory_order_relaxed) ? 1.0f : -1.0f;
+
+                    const float parallax_h = sign * head_h * sensitivity / view_dist;
+                    const float parallax_v = sign * head_v * sensitivity / view_dist;
+
+                    if (!g_hook->m_has_double_precision) {
+                        (*out)[2][0] += parallax_h;  // += not = (I2: parallax adds to convergence)
+                        (*out)[2][1] += parallax_v;
+                    } else {
+                        double_matrix[2][0] += (double)parallax_h;
+                        double_matrix[2][1] += (double)parallax_v;
+                    }
+                }
             }
         }
     } else {

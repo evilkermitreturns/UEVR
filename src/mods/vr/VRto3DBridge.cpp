@@ -383,4 +383,133 @@ float VRto3DBridge::calculate_zoom_depth_multiplier(float fov_scale) const {
     return calculate_zoom_depth_multiplier(fov_scale, zoom_factor, DepthMode::Scope);
 }
 
+// ---- Leia LookAround ----
+
+void VRto3DBridge::update_leia_tracking() {
+    // Per-frame call (Lesson 142: NOT gated by bridge dirty check)
+    auto& ms = ue3d::MonitorState::get();
+    if (!ms.bLeiaLookAroundEnabled.load(std::memory_order_relaxed)) return;
+    if (!is_initialized()) return;
+
+    read_leia_eye_data();
+}
+
+void VRto3DBridge::reset_leia_calibration() {
+    m_leia_calibrated = false;
+    m_leia_smooth_x = 0.0f;
+    m_leia_smooth_y = 0.0f;
+    m_leia_smooth_z = 0.0f;
+    m_leia_ref_x = 0.0f;
+    m_leia_ref_y = 0.0f;
+    m_leia_ref_z = 0.0f;
+    m_leia_last_frame = 0;
+
+    auto& ms = ue3d::MonitorState::get();
+    ms.fLeiaHeadX.store(0.0f, std::memory_order_relaxed);
+    ms.fLeiaHeadY.store(0.0f, std::memory_order_relaxed);
+    ms.fLeiaHeadZ.store(0.0f, std::memory_order_relaxed);
+    ms.bLeiaTracking.store(false, std::memory_order_relaxed);
+    ms.uLeiaFrameCounter.store(0, std::memory_order_relaxed);
+
+    spdlog::info("[VRto3DBridge] Leia calibration reset");
+}
+
+void VRto3DBridge::read_leia_eye_data() {
+    // Read Leia eye positions from shared memory (written by 3DGameBridge)
+    // Pipeline: shared mem -> NaN guard -> center eye -> calibrate -> coord convert -> gate -> smooth -> MonitorState
+
+    auto& ms = ue3d::MonitorState::get();
+
+    // Lock-free read of shared memory Leia fields
+    // (3DGameBridge writes atomically per-field, we tolerate one-frame tearing)
+    if (!m_data) {
+        ms.bLeiaTracking.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    // Check if 3DGameBridge is writing Leia data
+    bool tracking = m_data->leia_tracking_active != 0;
+    uint32_t frame = m_data->leia_frame_counter;
+
+    if (!tracking || frame == 0) {
+        ms.bLeiaTracking.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    // Skip if no new data since last read
+    if (frame == m_leia_last_frame) return;
+    m_leia_last_frame = frame;
+
+    // Read raw eye positions (Leia coords: mm, X=right, Y=up, Z=backward)
+    float lx = m_data->leia_left_eye_x;
+    float ly = m_data->leia_left_eye_y;
+    float lz = m_data->leia_left_eye_z;
+    float rx = m_data->leia_right_eye_x;
+    float ry = m_data->leia_right_eye_y;
+    float rz = m_data->leia_right_eye_z;
+
+    // NaN guard (I8)
+    if (!std::isfinite(lx) || !std::isfinite(ly) || !std::isfinite(lz) ||
+        !std::isfinite(rx) || !std::isfinite(ry) || !std::isfinite(rz)) {
+        return;  // skip bad frame, keep last good values
+    }
+
+    // Center eye (average both eyes for head translation)
+    float cx = (lx + rx) * 0.5f;
+    float cy = (ly + ry) * 0.5f;
+    float cz = (lz + rz) * 0.5f;
+
+    // Dynamic calibration: first tracked frame = zero reference
+    if (!m_leia_calibrated) {
+        m_leia_ref_x = cx;
+        m_leia_ref_y = cy;
+        m_leia_ref_z = cz;
+        m_leia_calibrated = true;
+        spdlog::info("[VRto3DBridge] Leia: calibrated zero reference ({:.1f}, {:.1f}, {:.1f}) mm",
+            cx, cy, cz);
+    }
+
+    // Offset from zero reference (still in Leia mm coords)
+    float dx_mm = cx - m_leia_ref_x;
+    float dy_mm = cy - m_leia_ref_y;
+    float dz_mm = cz - m_leia_ref_z;
+
+    // Leia -> UE coordinate conversion: (-Z, X, Y), mm/10 for cm
+    // Leia: X=right, Y=up, Z=backward
+    // UE:   X=forward, Y=right, Z=up
+    // So: UE_X = -Leia_Z, UE_Y = Leia_X, UE_Z = Leia_Y
+    // For parallax we only need horizontal (UE_Y = Leia_X) and vertical (UE_Z = Leia_Y)
+    float head_h_cm = dx_mm / 10.0f;   // horizontal offset (Leia X -> cm)
+    float head_v_cm = dy_mm / 10.0f;   // vertical offset (Leia Y -> cm)
+    float head_d_cm = -dz_mm / 10.0f;  // depth offset (-Leia Z -> cm, forward positive)
+
+    // Per-axis gating
+    if (!ms.bLeiaAxisX.load(std::memory_order_relaxed)) head_h_cm = 0.0f;
+    if (!ms.bLeiaAxisY.load(std::memory_order_relaxed)) head_v_cm = 0.0f;
+    if (!ms.bLeiaAxisZ.load(std::memory_order_relaxed)) head_d_cm = 0.0f;
+
+    // EMA smoothing
+    float alpha = ms.leia_smoothing_safe();
+    m_leia_smooth_x = alpha * head_h_cm + (1.0f - alpha) * m_leia_smooth_x;
+    m_leia_smooth_y = alpha * head_v_cm + (1.0f - alpha) * m_leia_smooth_y;
+    m_leia_smooth_z = alpha * head_d_cm + (1.0f - alpha) * m_leia_smooth_z;
+
+    // Write to MonitorState (I8: values are finite since inputs are finite + linear ops)
+    ms.fLeiaHeadX.store(m_leia_smooth_x, std::memory_order_relaxed);
+    ms.fLeiaHeadY.store(m_leia_smooth_y, std::memory_order_relaxed);
+    ms.fLeiaHeadZ.store(m_leia_smooth_z, std::memory_order_relaxed);
+    ms.bLeiaTracking.store(true, std::memory_order_relaxed);
+    ms.uLeiaFrameCounter.store(frame, std::memory_order_relaxed);
+
+    // Display dimensions (for auto-calibration)
+    float dw = m_data->leia_display_width_cm;
+    float dh = m_data->leia_display_height_cm;
+    if (std::isfinite(dw) && dw > 0.0f) {
+        ms.fLeiaDisplayWidthCm.store(dw, std::memory_order_relaxed);
+    }
+    if (std::isfinite(dh) && dh > 0.0f) {
+        ms.fLeiaDisplayHeightCm.store(dh, std::memory_order_relaxed);
+    }
+}
+
 } // namespace vrmod

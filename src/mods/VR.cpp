@@ -2030,6 +2030,21 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
                 vrmod::GameFOV::get().config().cutscene_strength_mult = *v;
             }
         }
+
+        // Leia LookAround
+        if (auto v = cfg.get<bool>("ue3d_leia_look_enabled")) ms.bLeiaLookAroundEnabled.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_invert")) ms.bLeiaLookInvert.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<float>("ue3d_leia_sensitivity")) {
+            if (std::isfinite(*v) && *v >= 0.1f && *v <= 5.0f)
+                ms.fLeiaSensitivity.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<float>("ue3d_leia_smoothing")) {
+            if (std::isfinite(*v) && *v >= 0.01f && *v <= 1.0f)
+                ms.fLeiaSmoothing.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<bool>("ue3d_leia_axis_x")) ms.bLeiaAxisX.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_axis_y")) ms.bLeiaAxisY.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_axis_z")) ms.bLeiaAxisZ.store(*v, std::memory_order_relaxed);
     }
 }
 
@@ -2107,6 +2122,15 @@ void VR::on_config_save(utility::Config& cfg) {
         cfg.set<float>("ue3d_ads_str_mult", vrmod::GameFOV::get().config().ads_strength_mult);
         cfg.set<float>("ue3d_scope_str_mult", vrmod::GameFOV::get().config().scope_strength_mult);
         cfg.set<float>("ue3d_cut_str_mult", vrmod::GameFOV::get().config().cutscene_strength_mult);
+
+        // Leia LookAround
+        cfg.set<bool>("ue3d_leia_look_enabled", ms.bLeiaLookAroundEnabled.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_invert", ms.bLeiaLookInvert.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_leia_sensitivity", ms.fLeiaSensitivity.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_leia_smoothing", ms.fLeiaSmoothing.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_axis_x", ms.bLeiaAxisX.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_axis_y", ms.bLeiaAxisY.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_axis_z", ms.bLeiaAxisZ.load(std::memory_order_relaxed));
     }
 }
 
@@ -3285,6 +3309,79 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                         auto& depth_st = vrmod::GameFOV::get().state();
                         ImGui::TextDisabled("Depth: %.3f  Smoothed: %.3f  WS Mod: %.2fx",
                             depth_st.center_depth, depth_st.smoothed_depth, depth_st.depth_ws_modifier);
+                    }
+                }
+
+                ImGui::TreePop();
+            }
+
+            // LookAround (Leia eye tracking)
+            if (ImGui::TreeNode("LookAround")) {
+                ImGui::TextDisabled("Head tracking parallax for Leia displays");
+                ImGui::Spacing();
+
+                bool look_enabled = ms.bLeiaLookAroundEnabled.load(std::memory_order_relaxed);
+                if (ImGui::Checkbox("Enable LookAround", &look_enabled)) {
+                    ms.bLeiaLookAroundEnabled.store(look_enabled, std::memory_order_relaxed);
+                }
+
+                if (look_enabled) {
+                    bool look_invert = ms.bLeiaLookInvert.load(std::memory_order_relaxed);
+                    if (ImGui::Checkbox("Invert Direction", &look_invert)) {
+                        ms.bLeiaLookInvert.store(look_invert, std::memory_order_relaxed);
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled(look_invert ? "(Track)" : "(Window)");
+
+                    float sensitivity = ms.fLeiaSensitivity.load(std::memory_order_relaxed);
+                    if (ImGui::SliderFloat("Sensitivity", &sensitivity, 0.1f, 5.0f, "%.2f")) {
+                        if (std::isfinite(sensitivity)) {
+                            ms.fLeiaSensitivity.store(sensitivity, std::memory_order_relaxed);
+                        }
+                    }
+
+                    float smoothing = ms.fLeiaSmoothing.load(std::memory_order_relaxed);
+                    if (ImGui::SliderFloat("Smoothing", &smoothing, 0.01f, 1.0f, "%.2f")) {
+                        if (std::isfinite(smoothing)) {
+                            ms.fLeiaSmoothing.store(smoothing, std::memory_order_relaxed);
+                        }
+                    }
+
+                    bool axis_x = ms.bLeiaAxisX.load(std::memory_order_relaxed);
+                    bool axis_y = ms.bLeiaAxisY.load(std::memory_order_relaxed);
+                    bool axis_z = ms.bLeiaAxisZ.load(std::memory_order_relaxed);
+                    if (ImGui::Checkbox("X (horizontal)", &axis_x)) {
+                        ms.bLeiaAxisX.store(axis_x, std::memory_order_relaxed);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Y (vertical)", &axis_y)) {
+                        ms.bLeiaAxisY.store(axis_y, std::memory_order_relaxed);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Z (depth)", &axis_z)) {
+                        ms.bLeiaAxisZ.store(axis_z, std::memory_order_relaxed);
+                    }
+
+                    if (ImGui::Button("Recalibrate")) {
+                        vrmod::VRto3DBridge::get().reset_leia_calibration();
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+
+                    // Status
+                    bool tracking = ms.bLeiaTracking.load(std::memory_order_relaxed);
+                    uint32_t frames = ms.uLeiaFrameCounter.load(std::memory_order_relaxed);
+                    ImGui::Text("Tracking: %s  Frames: %u", tracking ? "Active" : "Inactive", frames);
+                    if (tracking) {
+                        ImGui::Text("Head: X=%.2f  Y=%.2f  Z=%.2f cm",
+                            ms.leia_head_x_safe(), ms.leia_head_y_safe(), ms.leia_head_z_safe());
+                    }
+
+                    float dw = ms.fLeiaDisplayWidthCm.load(std::memory_order_relaxed);
+                    float dh = ms.fLeiaDisplayHeightCm.load(std::memory_order_relaxed);
+                    if (dw > 0.0f && dh > 0.0f) {
+                        ImGui::Text("Display: %.1f x %.1f cm", dw, dh);
                     }
                 }
 

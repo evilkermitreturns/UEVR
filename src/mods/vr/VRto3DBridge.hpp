@@ -122,6 +122,10 @@ public:
     float get_vrto3d_fov_adjustment() const;
     bool get_is_monitor_display() const { return m_data && m_data->is_monitor_display; }
 
+    // Leia LookAround (3DGameBridge -> UEVR via shared memory)
+    void update_leia_tracking();      // per-frame: reads shared mem, smooths, writes MonitorState
+    void reset_leia_calibration();    // recalibrate zero reference
+
     // Calculate zoom depth multiplier with adaptive curve
     float calculate_zoom_depth_multiplier(float fov_scale, float zoom_factor, DepthMode mode) const;
 
@@ -136,6 +140,7 @@ private:
 
     void update_timestamp();
     void debug_log(const char* fmt, ...) const;
+    void read_leia_eye_data();        // internal: shared mem -> calibrate -> smooth -> MonitorState
 
     HANDLE m_mapping = nullptr;
     UE3D_SharedData* m_data = nullptr;
@@ -144,6 +149,16 @@ private:
     std::atomic<uint32_t> m_frame_count{0};
     uint32_t m_command_seq{0};
     bool m_monitor_mode{false};
+
+    // Leia smoothing state (not shared, bridge-local)
+    float m_leia_smooth_x{0.0f};
+    float m_leia_smooth_y{0.0f};
+    float m_leia_smooth_z{0.0f};
+    float m_leia_ref_x{0.0f};         // dynamic calibration zero reference
+    float m_leia_ref_y{0.0f};
+    float m_leia_ref_z{0.0f};
+    bool m_leia_calibrated{false};
+    uint32_t m_leia_last_frame{0};     // last seen leia_frame_counter
 
 public:
     void set_monitor_mode(bool enabled) { m_monitor_mode = enabled; }

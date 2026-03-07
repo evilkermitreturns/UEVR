@@ -84,6 +84,51 @@ struct MonitorState {
     // cached world_scale for convergence symmetry (written by view_offset, read by projection)
     std::atomic<float> fCachedWorldScale{100.0f};
 
+    // Leia LookAround
+    std::atomic<bool> bLeiaLookAroundEnabled{false};    // master enable toggle
+    std::atomic<bool> bLeiaLookInvert{false};            // invert parallax direction
+    std::atomic<bool> bLeiaTracking{false};              // true when face is tracked
+    std::atomic<float> fLeiaHeadX{0.0f};                 // smoothed head offset X (cm, right)
+    std::atomic<float> fLeiaHeadY{0.0f};                 // smoothed head offset Y (cm, up)
+    std::atomic<float> fLeiaHeadZ{0.0f};                 // smoothed head offset Z (cm, forward)
+    std::atomic<float> fLeiaSensitivity{1.0f};           // parallax sensitivity multiplier
+    std::atomic<float> fLeiaSmoothing{0.15f};            // EMA alpha (lower = smoother)
+    std::atomic<bool> bLeiaAxisX{true};                  // enable horizontal parallax
+    std::atomic<bool> bLeiaAxisY{true};                  // enable vertical parallax
+    std::atomic<bool> bLeiaAxisZ{false};                 // enable depth parallax (experimental)
+    std::atomic<uint32_t> uLeiaFrameCounter{0};          // frames with tracking data
+    std::atomic<float> fLeiaDisplayWidthCm{0.0f};        // physical display width from SR::Display
+    std::atomic<float> fLeiaDisplayHeightCm{0.0f};       // physical display height from SR::Display
+
+    // safe Leia reads
+    float leia_head_x_safe() const {
+        float v = fLeiaHeadX.load(std::memory_order_relaxed);
+        return std::isfinite(v) ? v : 0.0f;
+    }
+    float leia_head_y_safe() const {
+        float v = fLeiaHeadY.load(std::memory_order_relaxed);
+        return std::isfinite(v) ? v : 0.0f;
+    }
+    float leia_head_z_safe() const {
+        float v = fLeiaHeadZ.load(std::memory_order_relaxed);
+        return std::isfinite(v) ? v : 0.0f;
+    }
+    float leia_sensitivity_safe() const {
+        float v = fLeiaSensitivity.load(std::memory_order_relaxed);
+        if (!std::isfinite(v)) return 1.0f;
+        return (v < 0.1f) ? 0.1f : (v > 5.0f) ? 5.0f : v;
+    }
+    float leia_smoothing_safe() const {
+        float v = fLeiaSmoothing.load(std::memory_order_relaxed);
+        if (!std::isfinite(v)) return 0.15f;
+        return (v < 0.01f) ? 0.01f : (v > 1.0f) ? 1.0f : v;
+    }
+    float viewing_distance_safe() const {
+        float v = fViewingDistance_cm.load(std::memory_order_relaxed);
+        if (!std::isfinite(v) || v < 10.0f) return 65.0f;
+        return (v > 300.0f) ? 300.0f : v;
+    }
+
     // debug diagnostics
     std::atomic<bool> bForceFlat{false};
     std::atomic<uint32_t> uViewOffsetCalls{0};

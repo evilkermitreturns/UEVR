@@ -1223,6 +1223,9 @@ void GameFOV::update_vrto3d_bridge() {
     m_state.vrto3d_fov_adjustment = bridge.get_vrto3d_fov_adjustment();
     m_state.vrto3d_auto_depth = bridge.is_vrto3d_listener_enabled();
     m_state.vrto3d_profile_loaded = bridge.is_vrto3d_profile_loaded();
+
+    // Leia LookAround: read eye data every frame (Lesson 142: NOT inside dirty check)
+    bridge.update_leia_tracking();
 }
 
 float GameFOV::get_fov_scale() const {
