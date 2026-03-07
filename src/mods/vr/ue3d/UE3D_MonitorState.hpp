@@ -103,6 +103,12 @@ struct MonitorState {
     std::atomic<float> fLeiaDisplayWidthCm{0.0f};        // physical display width from SR::Display
     std::atomic<float> fLeiaDisplayHeightCm{0.0f};       // physical display height from SR::Display
 
+    // per-eye Kooima parallax (each eye gets its own off-axis projection)
+    std::atomic<float> fLeiaLeftEyeX{0.0f};              // left eye smoothed offset X (cm)
+    std::atomic<float> fLeiaLeftEyeY{0.0f};              // left eye smoothed offset Y (cm)
+    std::atomic<float> fLeiaRightEyeX{0.0f};             // right eye smoothed offset X (cm)
+    std::atomic<float> fLeiaRightEyeY{0.0f};             // right eye smoothed offset Y (cm)
+
     // safe Leia reads
     float leia_head_x_safe() const {
         float v = fLeiaHeadX.load(std::memory_order_relaxed);
@@ -114,6 +120,22 @@ struct MonitorState {
     }
     float leia_head_z_safe() const {
         float v = fLeiaHeadZ.load(std::memory_order_relaxed);
+        return std::isfinite(v) ? v : 0.0f;
+    }
+    float leia_left_eye_x_safe() const {
+        float v = fLeiaLeftEyeX.load(std::memory_order_relaxed);
+        return std::isfinite(v) ? v : 0.0f;
+    }
+    float leia_left_eye_y_safe() const {
+        float v = fLeiaLeftEyeY.load(std::memory_order_relaxed);
+        return std::isfinite(v) ? v : 0.0f;
+    }
+    float leia_right_eye_x_safe() const {
+        float v = fLeiaRightEyeX.load(std::memory_order_relaxed);
+        return std::isfinite(v) ? v : 0.0f;
+    }
+    float leia_right_eye_y_safe() const {
+        float v = fLeiaRightEyeY.load(std::memory_order_relaxed);
         return std::isfinite(v) ? v : 0.0f;
     }
     float leia_z_depth_strength_safe() const {

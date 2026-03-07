@@ -3389,14 +3389,14 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                     }
 
                     if (axis_z) {
-                        float z_depth = ms.fLeiaZDepthStrength.load(std::memory_order_relaxed);
-                        if (ImGui::SliderFloat("Z Depth", &z_depth, 0.0f, 3.0f, "%.2f")) {
-                            if (std::isfinite(z_depth)) {
-                                ms.fLeiaZDepthStrength.store(z_depth, std::memory_order_relaxed);
+                        float z_fov = ms.fLeiaZDepthStrength.load(std::memory_order_relaxed);
+                        if (ImGui::SliderFloat("Z FOV", &z_fov, 0.0f, 3.0f, "%.2f")) {
+                            if (std::isfinite(z_fov)) {
+                                ms.fLeiaZDepthStrength.store(z_fov, std::memory_order_relaxed);
                             }
                         }
                         ImGui::SameLine();
-                        ImGui::TextDisabled("Lean in = more 3D");
+                        ImGui::TextDisabled("Lean in = wider view");
                     }
 
                     if (ImGui::Button("Recalibrate")) {

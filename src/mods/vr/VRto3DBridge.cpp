@@ -402,12 +402,20 @@ void VRto3DBridge::reset_leia_calibration() {
     m_leia_ref_x = 0.0f;
     m_leia_ref_y = 0.0f;
     m_leia_ref_z = 0.0f;
+    m_leia_ref_lx = 0.0f; m_leia_ref_ly = 0.0f;
+    m_leia_ref_rx = 0.0f; m_leia_ref_ry = 0.0f;
+    m_leia_smooth_lx = 0.0f; m_leia_smooth_ly = 0.0f;
+    m_leia_smooth_rx = 0.0f; m_leia_smooth_ry = 0.0f;
     m_leia_last_frame = 0;
 
     auto& ms = ue3d::MonitorState::get();
     ms.fLeiaHeadX.store(0.0f, std::memory_order_relaxed);
     ms.fLeiaHeadY.store(0.0f, std::memory_order_relaxed);
     ms.fLeiaHeadZ.store(0.0f, std::memory_order_relaxed);
+    ms.fLeiaLeftEyeX.store(0.0f, std::memory_order_relaxed);
+    ms.fLeiaLeftEyeY.store(0.0f, std::memory_order_relaxed);
+    ms.fLeiaRightEyeX.store(0.0f, std::memory_order_relaxed);
+    ms.fLeiaRightEyeY.store(0.0f, std::memory_order_relaxed);
     ms.bLeiaTracking.store(false, std::memory_order_relaxed);
     ms.uLeiaFrameCounter.store(0, std::memory_order_relaxed);
 
@@ -464,6 +472,9 @@ void VRto3DBridge::read_leia_eye_data() {
         m_leia_ref_x = cx;
         m_leia_ref_y = cy;
         m_leia_ref_z = cz;
+        // Per-eye references (Kooima: each eye gets its own zero)
+        m_leia_ref_lx = lx; m_leia_ref_ly = ly;
+        m_leia_ref_rx = rx; m_leia_ref_ry = ry;
         m_leia_calibrated = true;
         spdlog::info("[VRto3DBridge] Leia: calibrated zero reference ({:.1f}, {:.1f}, {:.1f}) mm",
             cx, cy, cz);
@@ -494,10 +505,31 @@ void VRto3DBridge::read_leia_eye_data() {
     m_leia_smooth_y = alpha * head_v_cm + (1.0f - alpha) * m_leia_smooth_y;
     m_leia_smooth_z = alpha * head_d_cm + (1.0f - alpha) * m_leia_smooth_z;
 
+    // Per-eye Kooima parallax: each eye's delta from its own reference
+    // Leia X = horizontal, Y = vertical (same axes as center-eye)
+    float left_h_cm  = (lx - m_leia_ref_lx) / 10.0f;
+    float left_v_cm  = (ly - m_leia_ref_ly) / 10.0f;
+    float right_h_cm = (rx - m_leia_ref_rx) / 10.0f;
+    float right_v_cm = (ry - m_leia_ref_ry) / 10.0f;
+
+    // Per-axis gating (same gates as center-eye)
+    if (!ms.bLeiaAxisX.load(std::memory_order_relaxed)) { left_h_cm = 0.0f; right_h_cm = 0.0f; }
+    if (!ms.bLeiaAxisY.load(std::memory_order_relaxed)) { left_v_cm = 0.0f; right_v_cm = 0.0f; }
+
+    // EMA smoothing (same alpha as center-eye)
+    m_leia_smooth_lx = alpha * left_h_cm  + (1.0f - alpha) * m_leia_smooth_lx;
+    m_leia_smooth_ly = alpha * left_v_cm  + (1.0f - alpha) * m_leia_smooth_ly;
+    m_leia_smooth_rx = alpha * right_h_cm + (1.0f - alpha) * m_leia_smooth_rx;
+    m_leia_smooth_ry = alpha * right_v_cm + (1.0f - alpha) * m_leia_smooth_ry;
+
     // Write to MonitorState (I8: values are finite since inputs are finite + linear ops)
     ms.fLeiaHeadX.store(m_leia_smooth_x, std::memory_order_relaxed);
     ms.fLeiaHeadY.store(m_leia_smooth_y, std::memory_order_relaxed);
     ms.fLeiaHeadZ.store(m_leia_smooth_z, std::memory_order_relaxed);
+    ms.fLeiaLeftEyeX.store(m_leia_smooth_lx, std::memory_order_relaxed);
+    ms.fLeiaLeftEyeY.store(m_leia_smooth_ly, std::memory_order_relaxed);
+    ms.fLeiaRightEyeX.store(m_leia_smooth_rx, std::memory_order_relaxed);
+    ms.fLeiaRightEyeY.store(m_leia_smooth_ry, std::memory_order_relaxed);
     ms.bLeiaTracking.store(true, std::memory_order_relaxed);
     ms.uLeiaFrameCounter.store(frame, std::memory_order_relaxed);
 

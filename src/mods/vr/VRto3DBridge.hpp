@@ -154,9 +154,14 @@ private:
     float m_leia_smooth_x{0.0f};
     float m_leia_smooth_y{0.0f};
     float m_leia_smooth_z{0.0f};
-    float m_leia_ref_x{0.0f};         // dynamic calibration zero reference
+    float m_leia_ref_x{0.0f};         // dynamic calibration zero reference (center-eye)
     float m_leia_ref_y{0.0f};
     float m_leia_ref_z{0.0f};
+    // Per-eye Kooima calibration references + smoothing
+    float m_leia_ref_lx{0.0f}, m_leia_ref_ly{0.0f};
+    float m_leia_ref_rx{0.0f}, m_leia_ref_ry{0.0f};
+    float m_leia_smooth_lx{0.0f}, m_leia_smooth_ly{0.0f};
+    float m_leia_smooth_rx{0.0f}, m_leia_smooth_ry{0.0f};
     bool m_leia_calibrated{false};
     uint32_t m_leia_last_frame{0};     // last seen leia_frame_counter
 

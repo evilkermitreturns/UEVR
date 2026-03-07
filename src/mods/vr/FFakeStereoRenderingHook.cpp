@@ -5334,19 +5334,20 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
 
                 ms.fLastConvergenceShift.store(shift, std::memory_order_relaxed);
 
-                // Leia LookAround: physics-based off-axis projection from eye position
-                // The display is a window: M[2][0] = -eye_x / display_half_width (I13: AFTER convergence, I14: SAME both eyes)
+                // Kooima LookAround: per-eye off-axis projection from tracked eye position
+                // Each eye gets its own frustum shift: M[2][0] = -eye_x / display_half_width
+                // Per-eye calibration references eliminate static IPD bias (I13: AFTER convergence)
                 if (ms.bLeiaLookAroundEnabled.load(std::memory_order_relaxed) &&
                     ms.bLeiaTracking.load(std::memory_order_relaxed) &&
                     ms.uLeiaFrameCounter.load(std::memory_order_relaxed) > 0) {
 
-                    const float head_h = ms.leia_head_x_safe();  // horizontal offset (cm)
-                    const float head_v = ms.leia_head_y_safe();  // vertical offset (cm)
+                    // Per-eye parallax: left eye (view_index 0) or right eye (view_index 1)
+                    const float eye_h = (true_index == 0) ? ms.leia_left_eye_x_safe() : ms.leia_right_eye_x_safe();
+                    const float eye_v = (true_index == 0) ? ms.leia_left_eye_y_safe() : ms.leia_right_eye_y_safe();
                     const float sensitivity = ms.leia_sensitivity_safe();
 
                     // Physics: off-axis projection uses display dimensions, not viewing distance
-                    // M[2][0] = -eye_x / display_half_width. Sensitivity scales from physical (1.0).
-                    // Fallback to viewing_distance/4 if display dims unavailable (approximates ~30cm display at 65cm).
+                    // Fallback to viewing_distance/4 if display dims unavailable
                     const float dw = ms.fLeiaDisplayWidthCm.load(std::memory_order_relaxed);
                     const float dh = ms.fLeiaDisplayHeightCm.load(std::memory_order_relaxed);
                     const float view_dist = ms.viewing_distance_safe();
@@ -5355,8 +5356,8 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
 
                     const float inv_x = ms.bLeiaInvertX.load(std::memory_order_relaxed) ? 1.0f : -1.0f;
                     const float inv_y = ms.bLeiaInvertY.load(std::memory_order_relaxed) ? 1.0f : -1.0f;
-                    const float parallax_h = inv_x * head_h * sensitivity / half_w;
-                    const float parallax_v = inv_y * head_v * sensitivity / half_h;
+                    const float parallax_h = inv_x * eye_h * sensitivity / half_w;
+                    const float parallax_v = inv_y * eye_v * sensitivity / half_h;
 
                     if (!g_hook->m_has_double_precision) {
                         (*out)[2][0] += parallax_h;  // += not = (I2: parallax adds to convergence)
@@ -5366,31 +5367,25 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
                         double_matrix[2][1] += (double)parallax_v;
                     }
 
-                    // Z depth parallax — depth-dependent stereo scaling via M[3][0]
-                    // Lean forward = more 3D pop (close objects intensify more than far)
-                    // Per-eye (eye_sign): creates stereo disparity, not uniform shift (I14 exception)
-                    // Z uses viewing_distance as normalizer (stereo depth scales with distance, not display size)
-                    const float head_z = ms.leia_head_z_safe();
-                    const float z_strength = ms.leia_z_depth_strength_safe();
-                    if (z_strength > 0.0f && std::abs(head_z) > 0.01f) {
+                    // Kooima Z FOV modulation: M[0][0] scales with viewing distance
+                    // Lean forward (head_z > 0) = closer to window = wider FOV (smaller M[0][0])
+                    // Physical angular disparity also increases naturally — no stereo_depth scaling needed
+                    if (ms.bLeiaAxisZ.load(std::memory_order_relaxed)) {
+                        const float head_z = ms.leia_head_z_safe();
+                        const float z_sens = ms.leia_z_depth_strength_safe();
                         const float inv_z = ms.bLeiaInvertZ.load(std::memory_order_relaxed) ? -1.0f : 1.0f;
-                        const float z_parallax = eye_sign * inv_z * head_z * sensitivity * z_strength / view_dist;
 
-                        // Convergence depth in view space: z_conv = |eye_sep| * M[0][0] / |shift|
-                        // Automatically adapts to depth mode (ADS/Scope/Normal)
-                        const float eye_sep_abs = std::abs(ms.fLastEyeOffset.load(std::memory_order_relaxed));
-                        const float m00 = !g_hook->m_has_double_precision ? (*out)[0][0] : (float)double_matrix[0][0];
-                        const float shift_abs = std::abs(shift);
-                        const float z_conv = (eye_sep_abs > 0.001f && shift_abs > 0.0001f)
-                            ? eye_sep_abs * m00 / shift_abs
-                            : 400.0f;  // fallback ~4m
+                        if (z_sens > 0.0f && std::abs(head_z) > 0.01f) {
+                            float z_scale = 1.0f - (inv_z * head_z * z_sens / view_dist);
+                            z_scale = (z_scale < 0.80f) ? 0.80f : (z_scale > 1.25f) ? 1.25f : z_scale;
 
-                        if (!g_hook->m_has_double_precision) {
-                            (*out)[3][0] += z_parallax;
-                            (*out)[2][0] += -z_parallax / z_conv;
-                        } else {
-                            double_matrix[3][0] += (double)z_parallax;
-                            double_matrix[2][0] += (double)(-z_parallax / z_conv);
+                            if (!g_hook->m_has_double_precision) {
+                                (*out)[0][0] *= z_scale;
+                                (*out)[1][1] *= z_scale;
+                            } else {
+                                double_matrix[0][0] *= (double)z_scale;
+                                double_matrix[1][1] *= (double)z_scale;
+                            }
                         }
                     }
                 }
