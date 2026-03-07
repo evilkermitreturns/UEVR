@@ -86,7 +86,6 @@ struct MonitorState {
 
     // Leia LookAround
     std::atomic<bool> bLeiaLookAroundEnabled{false};    // master enable toggle
-    std::atomic<bool> bLeiaLookInvert{false};            // invert parallax direction
     std::atomic<bool> bLeiaTracking{false};              // true when face is tracked
     std::atomic<float> fLeiaHeadX{0.0f};                 // smoothed head offset X (cm, right)
     std::atomic<float> fLeiaHeadY{0.0f};                 // smoothed head offset Y (cm, up)
@@ -96,6 +95,10 @@ struct MonitorState {
     std::atomic<bool> bLeiaAxisX{true};                  // enable horizontal parallax
     std::atomic<bool> bLeiaAxisY{true};                  // enable vertical parallax
     std::atomic<bool> bLeiaAxisZ{false};                 // enable depth parallax (experimental)
+    std::atomic<bool> bLeiaInvertX{false};               // flip X parallax direction
+    std::atomic<bool> bLeiaInvertY{false};               // flip Y parallax direction
+    std::atomic<bool> bLeiaInvertZ{false};               // flip Z depth direction
+    std::atomic<float> fLeiaZDepthStrength{1.0f};        // Z depth-dependent stereo scaling strength (0=off, 1.0=normal, 3.0=max)
     std::atomic<uint32_t> uLeiaFrameCounter{0};          // frames with tracking data
     std::atomic<float> fLeiaDisplayWidthCm{0.0f};        // physical display width from SR::Display
     std::atomic<float> fLeiaDisplayHeightCm{0.0f};       // physical display height from SR::Display
@@ -112,6 +115,11 @@ struct MonitorState {
     float leia_head_z_safe() const {
         float v = fLeiaHeadZ.load(std::memory_order_relaxed);
         return std::isfinite(v) ? v : 0.0f;
+    }
+    float leia_z_depth_strength_safe() const {
+        float v = fLeiaZDepthStrength.load(std::memory_order_relaxed);
+        if (!std::isfinite(v)) return 1.0f;
+        return (v < 0.0f) ? 0.0f : (v > 3.0f) ? 3.0f : v;
     }
     float leia_sensitivity_safe() const {
         float v = fLeiaSensitivity.load(std::memory_order_relaxed);

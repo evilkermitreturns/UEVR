@@ -2033,7 +2033,6 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
 
         // Leia LookAround
         if (auto v = cfg.get<bool>("ue3d_leia_look_enabled")) ms.bLeiaLookAroundEnabled.store(*v, std::memory_order_relaxed);
-        if (auto v = cfg.get<bool>("ue3d_leia_invert")) ms.bLeiaLookInvert.store(*v, std::memory_order_relaxed);
         if (auto v = cfg.get<float>("ue3d_leia_sensitivity")) {
             if (std::isfinite(*v) && *v >= 0.1f && *v <= 5.0f)
                 ms.fLeiaSensitivity.store(*v, std::memory_order_relaxed);
@@ -2045,6 +2044,13 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
         if (auto v = cfg.get<bool>("ue3d_leia_axis_x")) ms.bLeiaAxisX.store(*v, std::memory_order_relaxed);
         if (auto v = cfg.get<bool>("ue3d_leia_axis_y")) ms.bLeiaAxisY.store(*v, std::memory_order_relaxed);
         if (auto v = cfg.get<bool>("ue3d_leia_axis_z")) ms.bLeiaAxisZ.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_inv_x")) ms.bLeiaInvertX.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_inv_y")) ms.bLeiaInvertY.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_inv_z")) ms.bLeiaInvertZ.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<float>("ue3d_leia_z_depth_strength")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 3.0f)
+                ms.fLeiaZDepthStrength.store(*v, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -2125,12 +2131,15 @@ void VR::on_config_save(utility::Config& cfg) {
 
         // Leia LookAround
         cfg.set<bool>("ue3d_leia_look_enabled", ms.bLeiaLookAroundEnabled.load(std::memory_order_relaxed));
-        cfg.set<bool>("ue3d_leia_invert", ms.bLeiaLookInvert.load(std::memory_order_relaxed));
         cfg.set<float>("ue3d_leia_sensitivity", ms.fLeiaSensitivity.load(std::memory_order_relaxed));
         cfg.set<float>("ue3d_leia_smoothing", ms.fLeiaSmoothing.load(std::memory_order_relaxed));
         cfg.set<bool>("ue3d_leia_axis_x", ms.bLeiaAxisX.load(std::memory_order_relaxed));
         cfg.set<bool>("ue3d_leia_axis_y", ms.bLeiaAxisY.load(std::memory_order_relaxed));
         cfg.set<bool>("ue3d_leia_axis_z", ms.bLeiaAxisZ.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_inv_x", ms.bLeiaInvertX.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_inv_y", ms.bLeiaInvertY.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_inv_z", ms.bLeiaInvertZ.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_leia_z_depth_strength", ms.fLeiaZDepthStrength.load(std::memory_order_relaxed));
     }
 }
 
@@ -3327,13 +3336,6 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 }
 
                 if (look_enabled) {
-                    bool look_invert = ms.bLeiaLookInvert.load(std::memory_order_relaxed);
-                    if (ImGui::Checkbox("Invert Direction", &look_invert)) {
-                        ms.bLeiaLookInvert.store(look_invert, std::memory_order_relaxed);
-                    }
-                    ImGui::SameLine();
-                    ImGui::TextDisabled(look_invert ? "(Track)" : "(Window)");
-
                     float sensitivity = ms.fLeiaSensitivity.load(std::memory_order_relaxed);
                     if (ImGui::SliderFloat("Sensitivity", &sensitivity, 0.1f, 5.0f, "%.2f")) {
                         if (std::isfinite(sensitivity)) {
@@ -3348,6 +3350,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                         }
                     }
 
+                    // Per-axis enable
                     bool axis_x = ms.bLeiaAxisX.load(std::memory_order_relaxed);
                     bool axis_y = ms.bLeiaAxisY.load(std::memory_order_relaxed);
                     bool axis_z = ms.bLeiaAxisZ.load(std::memory_order_relaxed);
@@ -3361,6 +3364,39 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                     ImGui::SameLine();
                     if (ImGui::Checkbox("Z (depth)", &axis_z)) {
                         ms.bLeiaAxisZ.store(axis_z, std::memory_order_relaxed);
+                    }
+
+                    // Per-axis invert (physics default is window mode; invert flips to track)
+                    bool inv_x = ms.bLeiaInvertX.load(std::memory_order_relaxed);
+                    bool inv_y = ms.bLeiaInvertY.load(std::memory_order_relaxed);
+                    bool inv_z = ms.bLeiaInvertZ.load(std::memory_order_relaxed);
+                    if (axis_x) {
+                        if (ImGui::Checkbox("Invert X", &inv_x)) {
+                            ms.bLeiaInvertX.store(inv_x, std::memory_order_relaxed);
+                        }
+                        ImGui::SameLine();
+                    }
+                    if (axis_y) {
+                        if (ImGui::Checkbox("Invert Y", &inv_y)) {
+                            ms.bLeiaInvertY.store(inv_y, std::memory_order_relaxed);
+                        }
+                        ImGui::SameLine();
+                    }
+                    if (axis_z) {
+                        if (ImGui::Checkbox("Invert Z", &inv_z)) {
+                            ms.bLeiaInvertZ.store(inv_z, std::memory_order_relaxed);
+                        }
+                    }
+
+                    if (axis_z) {
+                        float z_depth = ms.fLeiaZDepthStrength.load(std::memory_order_relaxed);
+                        if (ImGui::SliderFloat("Z Depth", &z_depth, 0.0f, 3.0f, "%.2f")) {
+                            if (std::isfinite(z_depth)) {
+                                ms.fLeiaZDepthStrength.store(z_depth, std::memory_order_relaxed);
+                            }
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("Lean in = more 3D");
                     }
 
                     if (ImGui::Button("Recalibrate")) {
