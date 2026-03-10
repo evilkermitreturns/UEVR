@@ -1,3 +1,4 @@
+#include <cmath>
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <openvr.h>
@@ -18,6 +19,7 @@ namespace pixel_shader1 {
 #include "../VR.hpp"
 
 #include "D3D11Component.hpp"
+#include "ue3d/UE3D_MonitorState.hpp"
 
 //#define VERBOSE_D3D11
 
@@ -518,6 +520,78 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                     m_openxr.create_swapchains(); // recreate swapchains to match the new depth size
                 }
             }
+
+            // Monitor mode depth readback: sample center pixel for depth-aware stereo
+            auto& depth_ms = ue3d::MonitorState::get();
+            if (depth_ms.bMonitorMode.load(std::memory_order_relaxed) &&
+                depth_ms.bDepthAutoScale.load(std::memory_order_relaxed)) {
+
+                // Read every 4 frames (~15 samples/sec at 60fps) to limit GPU stalls
+                if (++m_depth_readback_skip >= 4) {
+                    m_depth_readback_skip = 0;
+
+                    // Create/recreate staging texture on size or format change
+                    if (m_depth_staging_tex == nullptr ||
+                        m_depth_staging_width != desc.Width ||
+                        m_depth_staging_height != desc.Height) {
+
+                        auto device = g_framework->get_d3d11_hook()->get_device();
+                        D3D11_TEXTURE2D_DESC staging_desc = desc;
+                        staging_desc.Usage = D3D11_USAGE_STAGING;
+                        staging_desc.BindFlags = 0;
+                        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        staging_desc.MiscFlags = 0;
+
+                        m_depth_staging_tex.Reset();
+                        if (SUCCEEDED(device->CreateTexture2D(&staging_desc, nullptr, &m_depth_staging_tex))) {
+                            m_depth_staging_width = desc.Width;
+                            m_depth_staging_height = desc.Height;
+                            m_depth_format = desc.Format;
+                            spdlog::info("[UE3D] Depth staging: {}x{} fmt={}",
+                                desc.Width, desc.Height, (uint32_t)desc.Format);
+                        }
+                    }
+
+                    if (m_depth_staging_tex != nullptr) {
+                        ComPtr<ID3D11DeviceContext> depth_ctx;
+                        g_framework->get_d3d11_hook()->get_device()->GetImmediateContext(&depth_ctx);
+
+                        depth_ctx->CopyResource(m_depth_staging_tex.Get(), scene_depth_tex.Get());
+
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        if (SUCCEEDED(depth_ctx->Map(m_depth_staging_tex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                            uint32_t cx = m_depth_staging_width / 2;
+                            uint32_t cy = m_depth_staging_height / 2;
+                            float depth_val = 0.0f;
+
+                            if (m_depth_format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+                                m_depth_format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                                // 32-bit float depth + 8-bit stencil + 24-bit pad = 8 bytes/pixel
+                                const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + cy * mapped.RowPitch;
+                                depth_val = *reinterpret_cast<const float*>(row + cx * 8);
+                            } else if (m_depth_format == DXGI_FORMAT_R32_FLOAT ||
+                                       m_depth_format == DXGI_FORMAT_D32_FLOAT) {
+                                // 32-bit float depth = 4 bytes/pixel
+                                const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + cy * mapped.RowPitch;
+                                depth_val = *reinterpret_cast<const float*>(row + cx * 4);
+                            } else if (m_depth_format == DXGI_FORMAT_R24G8_TYPELESS ||
+                                       m_depth_format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                                // 24-bit unorm depth + 8-bit stencil = 4 bytes/pixel
+                                const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + cy * mapped.RowPitch;
+                                uint32_t raw = *reinterpret_cast<const uint32_t*>(row + cx * 4);
+                                depth_val = static_cast<float>(raw & 0x00FFFFFFu) / 16777215.0f;
+                            }
+
+                            depth_ctx->Unmap(m_depth_staging_tex.Get(), 0);
+
+                            // UE reversed-Z: 1.0 = near, 0.0 = far
+                            if (std::isfinite(depth_val) && depth_val >= 0.0f && depth_val <= 1.0f) {
+                                m_center_depth_value.store(depth_val, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
     #ifdef AFR_DEPTH_TEMP_DISABLED
@@ -637,14 +711,19 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    } else { // Copy the left eye on AFR
-                        src_box.left = 0;
-                        src_box.right = m_backbuffer_size[0] / 2;
+                    } else { // Copy the left eye on AFR (monitor mode: right half for right eye)
+                        if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+                            src_box.left = m_backbuffer_size[0] / 2;
+                            src_box.right = m_backbuffer_size[0];
+                        } else {
+                            src_box.left = 0;
+                            src_box.right = m_backbuffer_size[0] / 2;
+                        }
                         src_box.top = 0;
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    }   
+                    }
                 } else {
                     src_box.left = 0;
                     src_box.right = m_backbuffer_size[0];
@@ -689,7 +768,25 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
 
             auto& openxr_overlay = vr->get_overlay_component().get_openxr();
 
-            if (vr->m_2d_screen_mode->value()) {
+            if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)
+                && m_openxr.ever_acquired((uint32_t)runtimes::OpenXR::SwapchainIndex::UI))
+            {
+                // Monitor mode: per-eye overlays for stereoscopic HUD depth
+                // Both eyes use same UI swapchain content, different positions
+                const auto left_layer = openxr_overlay.generate_slate_layer(
+                    runtimes::OpenXR::SwapchainIndex::UI,
+                    XrEyeVisibility::XR_EYE_VISIBILITY_LEFT);
+                const auto right_layer = openxr_overlay.generate_slate_layer(
+                    runtimes::OpenXR::SwapchainIndex::UI,
+                    XrEyeVisibility::XR_EYE_VISIBILITY_RIGHT);
+
+                if (left_layer) {
+                    quad_layers.push_back(&left_layer->get());
+                }
+                if (right_layer) {
+                    quad_layers.push_back(&right_layer->get());
+                }
+            } else if (vr->m_2d_screen_mode->value()) {
                 const auto left_layer = openxr_overlay.generate_slate_layer(runtimes::OpenXR::SwapchainIndex::UI, XrEyeVisibility::XR_EYE_VISIBILITY_LEFT);
                 const auto right_layer = openxr_overlay.generate_slate_layer(runtimes::OpenXR::SwapchainIndex::UI_RIGHT, XrEyeVisibility::XR_EYE_VISIBILITY_RIGHT);
 
@@ -777,14 +874,19 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    } else { // Copy the left eye on AFR
-                        src_box.left = 0;
-                        src_box.right = m_backbuffer_size[0] / 2;
+                    } else { // Copy the left eye on AFR (monitor mode: right half for right eye)
+                        if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+                            src_box.left = m_backbuffer_size[0] / 2;
+                            src_box.right = m_backbuffer_size[0];
+                        } else {
+                            src_box.left = 0;
+                            src_box.right = m_backbuffer_size[0] / 2;
+                        }
                         src_box.top = 0;
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    }   
+                    }
                 } else {
                     src_box.left = 0;
                     src_box.right = m_backbuffer_size[0];

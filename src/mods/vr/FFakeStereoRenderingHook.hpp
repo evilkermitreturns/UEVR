@@ -331,6 +331,8 @@ public:
     void on_frame() override;
     void on_draw_ui() override;
 
+    bool set_init_canvas_hook_enabled(bool enabled);
+
     auto get_frame_delay_compensation() const {
         return m_frame_delay_compensation->value();
     }
@@ -483,6 +485,7 @@ private:
     std::unique_ptr<PointerHook> m_get_render_target_manager_hook{};
     std::unique_ptr<PointerHook> m_get_stereo_layers_hook{};
     std::unique_ptr<PointerHook> m_init_canvas_hook{};
+    void** m_init_canvas_vtable_entry{nullptr};  // Saved for deferred hook creation (toggle)
     std::unique_ptr<PointerHook> m_get_desired_number_of_views_hook{};
     std::unique_ptr<PointerHook> m_get_view_pass_for_index_hook{};
     std::unique_ptr<PointerHook> m_update_viewport_rhi_hook{};

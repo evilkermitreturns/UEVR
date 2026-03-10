@@ -17,6 +17,7 @@
 #include "d3d12/DirectXTK.hpp"
 
 #include "D3D12Component.hpp"
+#include "ue3d/UE3D_MonitorState.hpp"
 
 //#define AFR_DEPTH_TEMP_DISABLED
 
@@ -427,6 +428,159 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
         }
 
+        // Monitor mode depth readback: sample center pixel for depth-aware stereo (DX12)
+        auto& depth_ms = ue3d::MonitorState::get();
+        if (depth_ms.bMonitorMode.load(std::memory_order_relaxed) &&
+            depth_ms.bDepthAutoScale.load(std::memory_order_relaxed) &&
+            scene_depth_tex != nullptr) {
+
+            // Read every 4 frames (~15 samples/sec at 60fps) to limit GPU stalls
+            if (++m_depth_readback_skip >= 4) {
+                m_depth_readback_skip = 0;
+
+                const auto desc = scene_depth_tex->GetDesc();
+                auto device = g_framework->get_d3d12_hook()->get_device();
+
+                // Create/recreate readback buffer on size or format change
+                if (m_depth_readback_buffer == nullptr ||
+                    m_depth_staging_width != desc.Width ||
+                    m_depth_staging_height != desc.Height ||
+                    m_depth_format != desc.Format) {
+
+                    m_depth_readback_buffer.Reset();
+
+                    // Get the footprint for a single row of the depth texture
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+                    UINT64 total_bytes = 0;
+                    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total_bytes);
+
+                    // Readback buffer sized for one full row (minimum for CopyTextureRegion)
+                    D3D12_HEAP_PROPERTIES heap_props{};
+                    heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+
+                    D3D12_RESOURCE_DESC buf_desc{};
+                    buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                    buf_desc.Width = footprint.Footprint.RowPitch; // one row
+                    buf_desc.Height = 1;
+                    buf_desc.DepthOrArraySize = 1;
+                    buf_desc.MipLevels = 1;
+                    buf_desc.Format = DXGI_FORMAT_UNKNOWN;
+                    buf_desc.SampleDesc.Count = 1;
+                    buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+                    if (SUCCEEDED(device->CreateCommittedResource(
+                        &heap_props, D3D12_HEAP_FLAG_NONE, &buf_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                        IID_PPV_ARGS(&m_depth_readback_buffer)))) {
+
+                        m_depth_staging_width = desc.Width;
+                        m_depth_staging_height = desc.Height;
+                        m_depth_format = desc.Format;
+                        spdlog::info("[UE3D] DX12 Depth readback: {}x{} fmt={}",
+                            desc.Width, desc.Height, (uint32_t)desc.Format);
+                    } else {
+                        spdlog::error("[UE3D] Failed to create DX12 depth readback buffer");
+                    }
+                }
+
+                // Setup command context if needed
+                if (!m_depth_readback_commands.ready()) {
+                    m_depth_readback_commands.setup(L"UE3D Depth Readback");
+                }
+
+                if (m_depth_readback_buffer != nullptr && m_depth_readback_commands.ready()) {
+                    // Wait for any previous readback to complete
+                    m_depth_readback_commands.wait(INFINITE);
+
+                    auto cmd_list = m_depth_readback_commands.cmd_list.Get();
+
+                    // Barrier: depth tex -> COPY_SOURCE
+                    D3D12_RESOURCE_BARRIER barrier{};
+                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                    barrier.Transition.pResource = scene_depth_tex.Get();
+                    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    barrier.Transition.StateBefore = ENGINE_SRC_DEPTH;
+                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    cmd_list->ResourceBarrier(1, &barrier);
+
+                    // Copy center pixel row from depth texture to readback buffer
+                    const uint32_t cx = m_depth_staging_width / 2;
+                    const uint32_t cy = m_depth_staging_height / 2;
+
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+                    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
+
+                    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+                    dst_loc.pResource = m_depth_readback_buffer.Get();
+                    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    dst_loc.PlacedFootprint = footprint;
+                    // Override to copy just one row at center Y
+                    dst_loc.PlacedFootprint.Footprint.Height = 1;
+                    dst_loc.PlacedFootprint.Offset = 0;
+
+                    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+                    src_loc.pResource = scene_depth_tex.Get();
+                    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    src_loc.SubresourceIndex = 0;
+
+                    // Copy single row at center Y
+                    D3D12_BOX src_box{};
+                    src_box.left = 0;
+                    src_box.top = cy;
+                    src_box.front = 0;
+                    src_box.right = m_depth_staging_width;
+                    src_box.bottom = cy + 1;
+                    src_box.back = 1;
+
+                    cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+
+                    // Barrier: depth tex -> original state
+                    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    barrier.Transition.StateAfter = ENGINE_SRC_DEPTH;
+                    cmd_list->ResourceBarrier(1, &barrier);
+
+                    // Execute and wait (synchronous — acceptable at every-4-frames rate)
+                    m_depth_readback_commands.execute();
+                    m_depth_readback_commands.wait(INFINITE);
+
+                    // Map and read center pixel
+                    void* mapped_data = nullptr;
+                    D3D12_RANGE read_range{0, footprint.Footprint.RowPitch};
+                    if (SUCCEEDED(m_depth_readback_buffer->Map(0, &read_range, &mapped_data))) {
+                        float depth_val = 0.0f;
+
+                        if (m_depth_format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+                            m_depth_format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                            // 32-bit float depth + 8-bit stencil + 24-bit pad = 8 bytes/pixel
+                            depth_val = *reinterpret_cast<const float*>(
+                                static_cast<const uint8_t*>(mapped_data) + cx * 8);
+                        } else if (m_depth_format == DXGI_FORMAT_R32_FLOAT ||
+                                   m_depth_format == DXGI_FORMAT_D32_FLOAT ||
+                                   m_depth_format == DXGI_FORMAT_R32_TYPELESS) {
+                            // 32-bit float depth = 4 bytes/pixel
+                            depth_val = *reinterpret_cast<const float*>(
+                                static_cast<const uint8_t*>(mapped_data) + cx * 4);
+                        } else if (m_depth_format == DXGI_FORMAT_R24G8_TYPELESS ||
+                                   m_depth_format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                            // 24-bit unorm depth + 8-bit stencil = 4 bytes/pixel
+                            uint32_t raw = *reinterpret_cast<const uint32_t*>(
+                                static_cast<const uint8_t*>(mapped_data) + cx * 4);
+                            depth_val = static_cast<float>(raw & 0x00FFFFFFu) / 16777215.0f;
+                        }
+
+                        D3D12_RANGE written_range{0, 0}; // we didn't write
+                        m_depth_readback_buffer->Unmap(0, &written_range);
+
+                        // UE reversed-Z: 1.0 = near, 0.0 = far
+                        if (std::isfinite(depth_val) && depth_val >= 0.0f && depth_val <= 1.0f) {
+                            m_center_depth_value.store(depth_val, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+        }
+
     #ifdef AFR_DEPTH_TEMP_DISABLED
         if (is_actually_afr) {
             scene_depth_tex.Reset();
@@ -526,14 +680,19 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    } else { // Copy the left eye on AFR
-                        src_box.left = 0;
-                        src_box.right = m_backbuffer_size[0] / 2;
+                    } else { // Copy the left eye on AFR (monitor mode: right half for right eye)
+                        if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+                            src_box.left = m_backbuffer_size[0] / 2;
+                            src_box.right = m_backbuffer_size[0];
+                        } else {
+                            src_box.left = 0;
+                            src_box.right = m_backbuffer_size[0] / 2;
+                        }
                         src_box.top = 0;
                         src_box.bottom = m_backbuffer_size[1];
                         src_box.front = 0;
                         src_box.back = 1;
-                    }   
+                    }
                 } else {
                     src_box.left = 0;
                     src_box.right = m_backbuffer_size[0];
@@ -598,7 +757,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     m_openvr.copy_left_to_right(m_scene_capture_tex.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
                 }
             } else {
-                m_openvr.copy_left_to_right(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+                // Monitor mode: right eye renders to right half of SBS texture
+                if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+                    m_openvr.copy_right(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+                } else {
+                    m_openvr.copy_left_to_right(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+                }
             }
 
             vr::D3D12TextureData_t right {
@@ -648,7 +812,25 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
             auto& openxr_overlay = vr->get_overlay_component().get_openxr();
 
-            if (vr->m_2d_screen_mode->value()) {
+            if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)
+                && m_openxr.ever_acquired((uint32_t)runtimes::OpenXR::SwapchainIndex::UI))
+            {
+                // Monitor mode: per-eye overlays for stereoscopic HUD depth
+                // Both eyes use same UI swapchain content, different positions
+                const auto left_layer = openxr_overlay.generate_slate_layer(
+                    runtimes::OpenXR::SwapchainIndex::UI,
+                    XrEyeVisibility::XR_EYE_VISIBILITY_LEFT);
+                const auto right_layer = openxr_overlay.generate_slate_layer(
+                    runtimes::OpenXR::SwapchainIndex::UI,
+                    XrEyeVisibility::XR_EYE_VISIBILITY_RIGHT);
+
+                if (left_layer) {
+                    quad_layers.push_back(&left_layer->get());
+                }
+                if (right_layer) {
+                    quad_layers.push_back(&right_layer->get());
+                }
+            } else if (vr->m_2d_screen_mode->value()) {
                 const auto left_layer = openxr_overlay.generate_slate_layer(runtimes::OpenXR::SwapchainIndex::UI, XrEyeVisibility::XR_EYE_VISIBILITY_LEFT);
                 const auto right_layer = openxr_overlay.generate_slate_layer(runtimes::OpenXR::SwapchainIndex::UI_RIGHT, XrEyeVisibility::XR_EYE_VISIBILITY_RIGHT);
 

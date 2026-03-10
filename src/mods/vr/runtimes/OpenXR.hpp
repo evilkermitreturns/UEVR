@@ -209,6 +209,13 @@ public:
     std::vector<XrView> views{};
     std::vector<XrView> stage_views{};
 
+    // VRto3D convergence fix (PR #372)
+    std::array<XrFovf, 2> m_last_fovs{};
+    bool m_fov_initialized{false};
+
+    // Game FOV passthrough (scope zoom)
+    float m_game_fov_scale{1.0f};
+
     //std::deque<std::vector<XrView>> stage_view_queue{};
     struct PipelineState {
         XrFrameState frame_state{XR_TYPE_FRAME_STATE};

@@ -24,6 +24,10 @@
 #include "utility/Logging.hpp"
 
 #include "VR.hpp"
+#include "vr/GameFOV.hpp"
+#include "vr/UE3D_Bridge.hpp"
+#include "vr/ue3d/UE3D_MonitorState.hpp"
+#include "vr/ue3d/UE3D_MonitorDetect.hpp"
 
 std::shared_ptr<VR>& VR::get() {
     //static std::shared_ptr<VR> instance = std::make_shared<VR>();
@@ -683,6 +687,15 @@ bool VR::on_message(HWND wnd, UINT message, WPARAM w_param, LPARAM l_param) {
         m_last_xinput_spoof_sent = std::chrono::steady_clock::now();
     }
 
+    // Monitor mode: track right mouse button for ADS disambiguation
+    if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+        if (message == WM_RBUTTONDOWN) {
+            ue3d::MonitorState::get().bMouseAiming.store(true, std::memory_order_relaxed);
+        } else if (message == WM_RBUTTONUP) {
+            ue3d::MonitorState::get().bMouseAiming.store(false, std::memory_order_relaxed);
+        }
+    }
+
     return true;
 }
 
@@ -698,6 +711,12 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         // Once here for normal gamepads, and once for the spoofed gamepad at the end
         update_imgui_state_from_xinput_state(*state, false);
         gamepad_snapturn(*state);
+
+        // Monitor mode: track left trigger for ADS disambiguation
+        if (ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
+            const bool lt_held = (state->Gamepad.bLeftTrigger > 25); // ~10% threshold
+            ue3d::MonitorState::get().bGamepadAiming.store(lt_held, std::memory_order_relaxed);
+        }
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -1369,6 +1388,115 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
 
     m_cvar_manager->on_pre_engine_tick(engine, delta);
     m_last_engine_tick = std::chrono::steady_clock::now();
+    // Register GameFOV save callback once
+    {
+        static bool gamefov_callback_registered = false;
+        if (!gamefov_callback_registered) {
+            vrmod::GameFOV::get().set_save_callback([]() {
+                if (g_framework) g_framework->deferred_save_config();
+            });
+            gamefov_callback_registered = true;
+        }
+    }
+    vrmod::GameFOV::get().set_world_scale(get_world_to_meters());
+    // Feed center-screen depth to GameFOV for depth-aware stereo (experimental)
+    if (ue3d::MonitorState::get().bDepthAutoScale.load(std::memory_order_relaxed)) {
+        if (m_is_d3d12) {
+            vrmod::GameFOV::get().set_center_depth(m_d3d12.get_center_depth_value());
+        } else {
+            vrmod::GameFOV::get().set_center_depth(m_d3d11.get_center_depth_value());
+        }
+    }
+    vrmod::GameFOV::get().update();
+
+    // Auto-detect monitor mode from VRto3D (one-shot on first valid connection)
+    auto& ms = ue3d::MonitorState::get();
+    {
+        static bool auto_detect_done = false;
+        if (!auto_detect_done) {
+            auto& bridge = vrmod::UE3D_Bridge::get();
+            if (bridge.is_initialized() && bridge.is_vrto3d_connected() && bridge.get_is_monitor_display()) {
+                ms.bMonitorMode.store(true, std::memory_order_relaxed);
+                ms.bFOVCalibrated.store(false, std::memory_order_relaxed);
+                bridge.set_monitor_mode(true);
+                auto_detect_done = true;
+                spdlog::info("[UE3D] Auto-detected monitor display from VRto3D - enabling monitor mode");
+            }
+        }
+    }
+
+    // Auto-detect physical monitor size
+    // Priority: Leia factory-calibrated > EDID > GDI
+    {
+        static bool monitor_size_detected = false;
+        static bool leia_size_applied = false;
+
+        if (ms.bMonitorMode.load(std::memory_order_relaxed)) {
+            // Primary: Leia factory-calibrated dimensions (may arrive late from 3DGameBridge)
+            if (!leia_size_applied) {
+                float leia_w = ms.fLeiaDisplayWidthCm.load(std::memory_order_relaxed);
+                float leia_h = ms.fLeiaDisplayHeightCm.load(std::memory_order_relaxed);
+                if (std::isfinite(leia_h) && leia_h > 1.0f && std::isfinite(leia_w) && leia_w > 1.0f) {
+                    float vert_inches = leia_h / 2.54f;
+                    ms.fVerticalInches.store(vert_inches, std::memory_order_relaxed);
+                    spdlog::info("[UE3D] Leia display detected: {:.1f} x {:.1f} cm = {:.1f}\" vertical (factory-calibrated)",
+                        leia_w, leia_h, vert_inches);
+                    leia_size_applied = true;
+                    monitor_size_detected = true;  // suppress EDID fallback
+                }
+            }
+
+            // Fallback: EDID/GDI (one-shot, only if Leia not yet available)
+            if (!monitor_size_detected) {
+                auto detected = ue3d::detect_monitor_size();
+                if (detected) {
+                    float vert_inches = detected->height_cm / 2.54f;
+                    float current = ms.fVerticalInches.load(std::memory_order_relaxed);
+                    if (std::abs(current - 13.24f) < 0.1f) {
+                        ms.fVerticalInches.store(vert_inches, std::memory_order_relaxed);
+                        spdlog::info("[UE3D] Auto-detected monitor (EDID fallback): {:.1f}cm x {:.1f}cm = {:.1f}\" vertical",
+                            detected->width_cm, detected->height_cm, vert_inches);
+                    }
+                }
+                monitor_size_detected = true;
+            }
+        }
+    }
+
+    // Physical stereo calibration (IPD, screen size, viewing distance)
+    // Priority: Leia factory width (exact) > EDID vertical inches × aspect ratio
+    if (ms.bMonitorMode.load(std::memory_order_relaxed)) {
+        const float ipd_cm = ms.fIPD_mm.load(std::memory_order_relaxed) / 10.0f;
+        const float vert_inches = ms.fVerticalInches.load(std::memory_order_relaxed);
+        const float view_dist_cm = ms.fViewingDistance_cm.load(std::memory_order_relaxed);
+
+        if (std::isfinite(ipd_cm) && std::isfinite(vert_inches) && std::isfinite(view_dist_cm)
+            && ipd_cm > 0.0f && vert_inches > 0.0f && view_dist_cm > 0.0f) {
+
+            // Leia factory width takes priority (no aspect ratio assumption)
+            float screen_w_cm;
+            const float leia_w = ms.fLeiaDisplayWidthCm.load(std::memory_order_relaxed);
+            if (std::isfinite(leia_w) && leia_w > 1.0f) {
+                screen_w_cm = leia_w;  // factory-calibrated, exact
+            } else {
+                const float vert_cm = vert_inches * ue3d::constants::INCHES_TO_CM;
+                screen_w_cm = vert_cm * ue3d::constants::DEFAULT_ASPECT;  // EDID fallback
+            }
+
+            const float stereo_depth = (screen_w_cm > 0.1f) ? (ipd_cm / screen_w_cm) : ue3d::constants::DEFAULT_STEREO_DEPTH;
+            const float convergence = (screen_w_cm > 0.1f) ? (view_dist_cm / (screen_w_cm * 0.5f)) : ue3d::constants::DEFAULT_CONVERGENCE;
+
+            if (std::isfinite(stereo_depth) && stereo_depth > 0.0f) {
+                ms.fStereoDepth.store(stereo_depth, std::memory_order_relaxed);
+            }
+            if (std::isfinite(convergence) && convergence > 0.0f) {
+                ms.fConvergence.store(convergence, std::memory_order_relaxed);
+            }
+        }
+
+        // Write monitor_mode to VRto3D bridge (read in update_all every frame)
+        vrmod::UE3D_Bridge::get().set_monitor_mode(true);
+    }
 
     if (!get_runtime()->loaded || !is_hmd_active()) {
         return;
@@ -1778,6 +1906,175 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
 
     // Load camera offsets
     load_cameras();
+
+    // Load GameFOV settings
+    if (!set_defaults) {
+        auto& gfov_cfg = vrmod::GameFOV::get().config();
+        if (auto v = cfg.get<float>("gamefov_base_fov")) {
+            if (std::isfinite(*v) && *v >= ue3d::constants::FOV_MIN && *v <= ue3d::constants::FOV_MAX) gfov_cfg.base_fov = *v;
+        }
+        if (auto v = cfg.get<int32_t>("gamefov_fov_mode")) gfov_cfg.fov_mode = static_cast<vrmod::FovMode>(*v);
+        if (auto v = cfg.get<float>("gamefov_zoom_threshold")) {
+            if (std::isfinite(*v) && *v >= 0.5f && *v <= 30.0f) gfov_cfg.zoom_threshold = *v;
+        }
+        if (auto v = cfg.get<bool>("gamefov_invert_zoom")) gfov_cfg.invert_zoom_detection = *v;
+        if (auto v = cfg.get<float>("gamefov_depth_strength")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 2.0f) gfov_cfg.depth_strength = *v;
+        }
+        if (auto v = cfg.get<int32_t>("gamefov_preset")) gfov_cfg.active_preset = static_cast<vrmod::DepthPreset>(*v);
+        if (auto v = cfg.get<float>("gamefov_depth_base_power")) {
+            if (std::isfinite(*v) && *v >= 0.1f && *v <= 3.0f) gfov_cfg.depth_base_power = *v;
+        }
+        if (auto v = cfg.get<float>("gamefov_depth_extra_power")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 3.0f) gfov_cfg.depth_extra_power = *v;
+        }
+        if (auto v = cfg.get<float>("gamefov_depth_dead_zone")) {
+            if (std::isfinite(*v) && *v >= 1.0f && *v <= 2.0f) gfov_cfg.depth_dead_zone = *v;
+        }
+        if (auto v = cfg.get<float>("gamefov_ads_min_depth")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 1.0f) gfov_cfg.ads_min_depth = *v;
+        }
+        if (auto v = cfg.get<float>("gamefov_scope_min_depth")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 1.0f) gfov_cfg.scope_min_depth = *v;
+        }
+        if (auto v = cfg.get<float>("gamefov_cutscene_min_depth")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 1.0f) gfov_cfg.cutscene_min_depth = *v;
+        }
+        if (auto v = cfg.get<bool>("gamefov_smooth")) gfov_cfg.smooth_transitions = *v;
+        if (auto v = cfg.get<float>("gamefov_lerp_speed")) {
+            if (std::isfinite(*v) && *v >= 0.01f && *v <= 1.0f) gfov_cfg.lerp_speed = *v;
+        }
+        if (auto v = cfg.get<bool>("gamefov_fov_comp")) gfov_cfg.vrto3d_fov_compensation = *v;
+        if (auto v = cfg.get<float>("gamefov_scope_zoom_threshold")) {
+            if (std::isfinite(*v) && *v >= 1.0f && *v <= 5.0f) gfov_cfg.scope_zoom_threshold = *v;
+        }
+        if (auto v = cfg.get<float>("gamefov_depth_attack_rate")) {
+            if (std::isfinite(*v) && *v > 0.0f && *v <= 50.0f) gfov_cfg.depth_attack_rate = *v;
+        }
+        if (auto v = cfg.get<float>("gamefov_depth_release_rate")) {
+            if (std::isfinite(*v) && *v > 0.0f && *v <= 50.0f) gfov_cfg.depth_release_rate = *v;
+        }
+        if (auto v = cfg.get<float>("gamefov_depth_ws_response")) {
+            if (std::isfinite(*v) && *v >= 0.05f && *v <= 1.5f) gfov_cfg.depth_ws_response = *v;
+        }
+
+        // UE3D monitor mode settings (validate all floats on load)
+        auto& ms = ue3d::MonitorState::get();
+        if (auto v = cfg.get<bool>("ue3d_monitor_mode")) ms.bMonitorMode.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<float>("ue3d_ipd_mm")) {
+            if (std::isfinite(*v) && *v >= 40.0f && *v <= 90.0f) ms.fIPD_mm.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<float>("ue3d_vert_inches")) {
+            if (std::isfinite(*v) && *v >= 3.0f && *v <= 60.0f) ms.fVerticalInches.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<float>("ue3d_view_dist_cm")) {
+            if (std::isfinite(*v) && *v >= 15.0f && *v <= 300.0f) ms.fViewingDistance_cm.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<float>("ue3d_3d_strength")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 2.0f) ms.f3DStrength.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<float>("ue3d_global_depth_floor")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 1.0f) ms.fGlobalDepthFloor.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<bool>("ue3d_depth_auto_scale")) {
+            // Force off on load — RenderTargetPoolHook crashes UE5 (lesson 95).
+            // User must re-enable manually each session if they want to try it.
+            if (*v) {
+                spdlog::warn("[UE3D] Depth Auto-Scale was saved as ON — forcing OFF (crashes UE5).");
+            }
+            ms.bDepthAutoScale.store(false, std::memory_order_relaxed);
+        }
+        // Per-mode HUD depth (all [-2, +2])
+        if (auto v = cfg.get<float>("ue3d_hud_depth_scale")) {
+            if (std::isfinite(*v) && *v >= -2.0f && *v <= 2.0f) {
+                ms.fHUDDepthScale.store(*v, std::memory_order_relaxed);
+            }
+        }
+        if (auto v = cfg.get<float>("ue3d_ads_hud_depth")) {
+            if (std::isfinite(*v) && *v >= -2.0f && *v <= 2.0f) {
+                ms.fADSHUDDepth.store(*v, std::memory_order_relaxed);
+            }
+        }
+        if (auto v = cfg.get<float>("ue3d_scope_hud_depth")) {
+            if (std::isfinite(*v) && *v >= -2.0f && *v <= 2.0f) {
+                ms.fScopeHUDDepth.store(*v, std::memory_order_relaxed);
+            }
+        }
+        if (auto v = cfg.get<float>("ue3d_cutscene_hud_depth")) {
+            if (std::isfinite(*v) && *v >= -2.0f && *v <= 2.0f) {
+                ms.fCutsceneHUDDepth.store(*v, std::memory_order_relaxed);
+            }
+        }
+        // Per-mode HUD size (all [0.5, 2.0])
+        if (auto v = cfg.get<float>("ue3d_normal_hud_size")) {
+            if (std::isfinite(*v) && *v >= 0.5f && *v <= 2.0f) {
+                ms.fNormalHUDSize.store(*v, std::memory_order_relaxed);
+            }
+        }
+        if (auto v = cfg.get<float>("ue3d_ads_hud_size")) {
+            if (std::isfinite(*v) && *v >= 0.5f && *v <= 2.0f) {
+                ms.fADSHUDSize.store(*v, std::memory_order_relaxed);
+            }
+        }
+        if (auto v = cfg.get<float>("ue3d_scope_hud_size")) {
+            if (std::isfinite(*v) && *v >= 0.5f && *v <= 2.0f) {
+                ms.fScopeHUDSize.store(*v, std::memory_order_relaxed);
+            }
+        }
+        if (auto v = cfg.get<float>("ue3d_cutscene_hud_size")) {
+            if (std::isfinite(*v) && *v >= 0.5f && *v <= 2.0f) {
+                ms.fCutsceneHUDSize.store(*v, std::memory_order_relaxed);
+            }
+        }
+        if (auto v = cfg.get<bool>("ue3d_hud_auto_size")) {
+            ms.bHUDAutoSize.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<bool>("ue3d_canvas_hud_hook")) {
+            ms.bCanvasHUDHook.store(*v, std::memory_order_relaxed);
+        }
+        // ue3d_viewport_hud_fix removed — RSSetViewports hooking crashed on DX12
+        if (auto v = cfg.get<float>("ue3d_ads_str_mult")) {
+            if (std::isfinite(*v) && *v >= -2.0f && *v <= 100.0f) {
+                vrmod::GameFOV::get().config().ads_strength_mult = *v;
+            }
+        }
+        if (auto v = cfg.get<float>("ue3d_scope_str_mult")) {
+            if (std::isfinite(*v) && *v >= -2.0f && *v <= 100.0f) {
+                vrmod::GameFOV::get().config().scope_strength_mult = *v;
+            }
+        }
+        if (auto v = cfg.get<float>("ue3d_cut_str_mult")) {
+            if (std::isfinite(*v) && *v >= -2.0f && *v <= 100.0f) {
+                vrmod::GameFOV::get().config().cutscene_strength_mult = *v;
+            }
+        }
+
+        // Leia LookAround
+        if (auto v = cfg.get<bool>("ue3d_leia_look_enabled")) ms.bLeiaLookAroundEnabled.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<float>("ue3d_leia_sensitivity")) {
+            if (std::isfinite(*v) && *v >= 0.1f && *v <= 5.0f)
+                ms.fLeiaSensitivity.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<float>("ue3d_leia_smoothing")) {
+            if (std::isfinite(*v) && *v >= 0.01f && *v <= 1.0f)
+                ms.fLeiaSmoothing.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<bool>("ue3d_leia_axis_x")) ms.bLeiaAxisX.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_axis_y")) ms.bLeiaAxisY.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_axis_z")) ms.bLeiaAxisZ.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_inv_x")) ms.bLeiaInvertX.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_inv_y")) ms.bLeiaInvertY.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_inv_z")) ms.bLeiaInvertZ.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<bool>("ue3d_leia_inv_z_stereo")) ms.bLeiaInvertZStereo.store(*v, std::memory_order_relaxed);
+        if (auto v = cfg.get<float>("ue3d_leia_z_depth_strength")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 3.0f)
+                ms.fLeiaZDepthStrength.store(*v, std::memory_order_relaxed);
+        }
+        if (auto v = cfg.get<float>("ue3d_leia_motion_parallax")) {
+            if (std::isfinite(*v) && *v >= 0.0f && *v <= 3.0f)
+                ms.fLeiaMotionParallax.store(*v, std::memory_order_relaxed);
+        }
+    }
 }
 
 void VR::on_config_save(utility::Config& cfg) {
@@ -1799,6 +2096,72 @@ void VR::on_config_save(utility::Config& cfg) {
 
     // Save camera offsets
     save_cameras();
+
+    // Save GameFOV settings
+    {
+        const auto& gfov_cfg = vrmod::GameFOV::get().config();
+        cfg.set<float>("gamefov_base_fov", gfov_cfg.base_fov);
+        cfg.set<int32_t>("gamefov_fov_mode", static_cast<int32_t>(gfov_cfg.fov_mode));
+        cfg.set<float>("gamefov_zoom_threshold", gfov_cfg.zoom_threshold);
+        cfg.set<bool>("gamefov_invert_zoom", gfov_cfg.invert_zoom_detection);
+        cfg.set<float>("gamefov_depth_strength", gfov_cfg.depth_strength);
+        cfg.set<int32_t>("gamefov_preset", static_cast<int32_t>(gfov_cfg.active_preset));
+        cfg.set<float>("gamefov_depth_base_power", gfov_cfg.depth_base_power);
+        cfg.set<float>("gamefov_depth_extra_power", gfov_cfg.depth_extra_power);
+        cfg.set<float>("gamefov_depth_dead_zone", gfov_cfg.depth_dead_zone);
+        cfg.set<float>("gamefov_ads_min_depth", gfov_cfg.ads_min_depth);
+        cfg.set<float>("gamefov_scope_min_depth", gfov_cfg.scope_min_depth);
+        cfg.set<float>("gamefov_cutscene_min_depth", gfov_cfg.cutscene_min_depth);
+        cfg.set<bool>("gamefov_smooth", gfov_cfg.smooth_transitions);
+        cfg.set<float>("gamefov_lerp_speed", gfov_cfg.lerp_speed);
+        cfg.set<bool>("gamefov_fov_comp", gfov_cfg.vrto3d_fov_compensation);
+        cfg.set<float>("gamefov_scope_zoom_threshold", gfov_cfg.scope_zoom_threshold);
+        cfg.set<float>("gamefov_depth_attack_rate", gfov_cfg.depth_attack_rate);
+        cfg.set<float>("gamefov_depth_release_rate", gfov_cfg.depth_release_rate);
+        cfg.set<float>("gamefov_depth_ws_response", gfov_cfg.depth_ws_response);
+    }
+
+    // UE3D monitor mode settings
+    {
+        const auto& ms = ue3d::MonitorState::get();
+        cfg.set<bool>("ue3d_monitor_mode", ms.bMonitorMode.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_ipd_mm", ms.fIPD_mm.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_vert_inches", ms.fVerticalInches.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_view_dist_cm", ms.fViewingDistance_cm.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_3d_strength", ms.f3DStrength.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_global_depth_floor", ms.fGlobalDepthFloor.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_depth_auto_scale", ms.bDepthAutoScale.load(std::memory_order_relaxed));
+        // Per-mode HUD depth
+        cfg.set<float>("ue3d_hud_depth_scale", ms.fHUDDepthScale.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_ads_hud_depth", ms.fADSHUDDepth.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_scope_hud_depth", ms.fScopeHUDDepth.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_cutscene_hud_depth", ms.fCutsceneHUDDepth.load(std::memory_order_relaxed));
+        // Per-mode HUD size
+        cfg.set<float>("ue3d_normal_hud_size", ms.fNormalHUDSize.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_ads_hud_size", ms.fADSHUDSize.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_scope_hud_size", ms.fScopeHUDSize.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_cutscene_hud_size", ms.fCutsceneHUDSize.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_hud_auto_size", ms.bHUDAutoSize.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_canvas_hud_hook", ms.bCanvasHUDHook.load(std::memory_order_relaxed));
+        // ue3d_viewport_hud_fix removed — RSSetViewports hooking crashed on DX12
+        cfg.set<float>("ue3d_ads_str_mult", vrmod::GameFOV::get().config().ads_strength_mult);
+        cfg.set<float>("ue3d_scope_str_mult", vrmod::GameFOV::get().config().scope_strength_mult);
+        cfg.set<float>("ue3d_cut_str_mult", vrmod::GameFOV::get().config().cutscene_strength_mult);
+
+        // Leia LookAround
+        cfg.set<bool>("ue3d_leia_look_enabled", ms.bLeiaLookAroundEnabled.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_leia_sensitivity", ms.fLeiaSensitivity.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_leia_smoothing", ms.fLeiaSmoothing.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_axis_x", ms.bLeiaAxisX.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_axis_y", ms.bLeiaAxisY.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_axis_z", ms.bLeiaAxisZ.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_inv_x", ms.bLeiaInvertX.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_inv_y", ms.bLeiaInvertY.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_inv_z", ms.bLeiaInvertZ.load(std::memory_order_relaxed));
+        cfg.set<bool>("ue3d_leia_inv_z_stereo", ms.bLeiaInvertZStereo.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_leia_z_depth_strength", ms.fLeiaZDepthStrength.load(std::memory_order_relaxed));
+        cfg.set<float>("ue3d_leia_motion_parallax", ms.fLeiaMotionParallax.load(std::memory_order_relaxed));
+    }
 }
 
 void VR::load_cameras() try {
@@ -2297,6 +2660,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
     enum SelectedPage {
         PAGE_RUNTIME,
+        PAGE_MONITOR,
         PAGE_UNREAL,
         PAGE_INPUT,
         PAGE_CAMERA,
@@ -2348,6 +2712,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
     switch (hash) {
     case "Runtime"_fnv:
         selected_page = PAGE_RUNTIME;
+        break;
+    case "Monitor 3D"_fnv:
+        selected_page = PAGE_MONITOR;
         break;
     case "Unreal"_fnv:
         selected_page = PAGE_UNREAL;
@@ -2408,6 +2775,753 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         m_overlay_component.on_draw_ui();
 
         ImGui::TreePop();
+    }
+
+    // Monitor 3D page
+    if (selected_page == PAGE_MONITOR) {
+        auto& ms = ue3d::MonitorState::get();
+        auto& gfov = vrmod::GameFOV::get();
+        auto& cfg = gfov.config();
+        auto& st = gfov.state();
+        auto& bridge = vrmod::UE3D_Bridge::get();
+
+        // Auto-init bridge when this page is visible
+        if (!cfg.vrto3d_bridge_enabled) {
+            cfg.vrto3d_bridge_enabled = true;
+        }
+        if (!bridge.is_initialized()) {
+            bridge.config().enabled = true;
+            bridge.config().debug_logging = cfg.debug_logging;
+            bridge.init();
+        }
+
+        // Header
+        bool monitor_mode = ms.bMonitorMode.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox("Enable Monitor Mode", &monitor_mode)) {
+            ms.bMonitorMode.store(monitor_mode, std::memory_order_relaxed);
+            if (monitor_mode) {
+                ms.bFOVCalibrated.store(false, std::memory_order_relaxed);
+                float current_fov = vrmod::GameFOV::get().state().game_fov;
+                ms.fGameFOV_FromMatrix.store(
+                    (current_fov > 5.0f && current_fov < 170.0f) ? current_fov : 90.0f,
+                    std::memory_order_relaxed);
+            } else {
+                bridge.set_monitor_mode(false);
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Renders stereo 3D to a 3D monitor via VRto3D.\nVRto3D bridge controls work in both VR and monitor mode.");
+        }
+
+        // Connection status
+        ImGui::SameLine();
+        if (st.vrto3d_connected) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "Connected");
+        } else if (bridge.is_initialized()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "Waiting...");
+        }
+
+        // Debug toggle
+        ImGui::SameLine();
+        ImGui::Checkbox("Debug", &cfg.debug_logging);
+
+        // Always-visible status summary
+        {
+            const auto& svst = vrmod::GameFOV::get().state();
+            const auto& svcfg = vrmod::GameFOV::get().config();
+            const auto svmode = gfov.get_depth_mode();
+            const bool svaim = ms.bIsAiming.load(std::memory_order_relaxed);
+
+            float diag_mode_mult = 1.0f;
+            const char* diag_mult_name = "base";
+            switch (svmode) {
+                case vrmod::DepthMode::ADS:
+                    diag_mode_mult = svcfg.ads_strength_mult;
+                    diag_mult_name = "ads";
+                    break;
+                case vrmod::DepthMode::Scope:
+                    diag_mode_mult = svcfg.scope_strength_mult;
+                    diag_mult_name = "scope";
+                    break;
+                case vrmod::DepthMode::Cutscene:
+                    diag_mode_mult = svcfg.cutscene_strength_mult;
+                    diag_mult_name = "cut";
+                    break;
+                default: break;
+            }
+            ImGui::TextDisabled("Mode: %s | Zoom: %.2fx | Aim: %s | Depth: %.2f",
+                vrmod::GameFOV::depth_mode_name(svmode),
+                svst.zoom_factor, svaim ? "yes" : "no",
+                svst.current_depth_multiplier);
+            ImGui::TextDisabled("  str=%.1f x %s_mult=%.1f => eff=%.1f | target=%.2f",
+                svcfg.depth_strength, diag_mult_name, diag_mode_mult,
+                svcfg.depth_strength * diag_mode_mult,
+                svst.target_depth_multiplier);
+        }
+
+        if (monitor_mode) {
+
+            // Display setup
+            ImGui::Separator();
+            ImGui::TextDisabled("Display Setup");
+
+            float ipd = ms.fIPD_mm.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat("IPD (mm)", &ipd, 55.0f, 75.0f, "%.1f")) {
+                ms.fIPD_mm.store(ipd, std::memory_order_relaxed);
+            }
+
+            float vert = ms.fVerticalInches.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat("Screen Height (inches)", &vert, 5.0f, 40.0f, "%.1f")) {
+                ms.fVerticalInches.store(vert, std::memory_order_relaxed);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Detect")) {
+                // Primary: Leia factory-calibrated dimensions
+                float leia_h = ms.fLeiaDisplayHeightCm.load(std::memory_order_relaxed);
+                if (std::isfinite(leia_h) && leia_h > 1.0f) {
+                    float new_vert = leia_h / 2.54f;
+                    ms.fVerticalInches.store(new_vert, std::memory_order_relaxed);
+                    spdlog::info("[UE3D] Detected from Leia display: {:.1f}\" vertical (factory)", new_vert);
+                } else {
+                    // Fallback: EDID/GDI
+                    auto detected = ue3d::detect_monitor_size();
+                    if (detected) {
+                        float new_vert = detected->height_cm / 2.54f;
+                        ms.fVerticalInches.store(new_vert, std::memory_order_relaxed);
+                        spdlog::info("[UE3D] Detected from EDID: {:.1f}\" vertical", new_vert);
+                    }
+                }
+            }
+            {
+                float leia_w = ms.fLeiaDisplayWidthCm.load(std::memory_order_relaxed);
+                if (ImGui::IsItemHovered()) {
+                    if (std::isfinite(leia_w) && leia_w > 1.0f) {
+                        ImGui::SetTooltip("Detect from Leia display (factory-calibrated).\nCurrently using Leia dimensions.");
+                    } else {
+                        ImGui::SetTooltip("Detect from Leia display (factory) or monitor EDID.\n27\" diagonal 16:9 = ~13.2\" vertical.");
+                    }
+                }
+            }
+
+            float dist = ms.fViewingDistance_cm.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat("Viewing Distance (cm)", &dist, 30.0f, 150.0f, "%.0f")) {
+                ms.fViewingDistance_cm.store(dist, std::memory_order_relaxed);
+            }
+
+            // 3D calibration
+            ImGui::Separator();
+            ImGui::TextDisabled("3D Calibration");
+
+            if (st.vrto3d_connected) {
+                // VRto3D depth buttons (bridge commands)
+                {
+                    float avail = ImGui::GetContentRegionAvail().x;
+                    float spacing = ImGui::GetStyle().ItemSpacing.x;
+                    float btn_w = (avail - spacing * 4) / 5.0f;
+
+                    if (ImGui::Button("VRto3D++", ImVec2(btn_w, 0))) { bridge.request_depth_big_increase(); }
+                    if (ImGui::IsItemHovered()) { ImGui::SetTooltip("VRto3D depth x1.4"); }
+                    ImGui::SameLine();
+                    if (ImGui::Button("VRto3D+", ImVec2(btn_w, 0))) { bridge.request_depth_increase(); }
+                    if (ImGui::IsItemHovered()) { ImGui::SetTooltip("VRto3D depth +20%%"); }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Calibrate", ImVec2(btn_w, 0))) { bridge.request_calibration(); }
+                    if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Auto-calculate from world scale"); }
+                    ImGui::SameLine();
+                    if (ImGui::Button("VRto3D-", ImVec2(btn_w, 0))) { bridge.request_depth_decrease(); }
+                    if (ImGui::IsItemHovered()) { ImGui::SetTooltip("VRto3D depth -20%%"); }
+                    ImGui::SameLine();
+                    if (ImGui::Button("VRto3D--", ImVec2(btn_w, 0))) { bridge.request_depth_big_decrease(); }
+                    if (ImGui::IsItemHovered()) { ImGui::SetTooltip("VRto3D depth x0.6"); }
+                }
+            }
+
+            float strength = ms.f3DStrength.load(std::memory_order_relaxed);
+            if (ImGui::SliderFloat("3D Strength", &strength, 0.0f, 2.0f, "%.2f")) {
+                ms.f3DStrength.store(strength, std::memory_order_relaxed);
+            }
+
+            if (st.vrto3d_connected) {
+                // Live 3D Effect bar
+                {
+                    float effect = st.current_depth_multiplier;
+                    char effect_label[32];
+                    snprintf(effect_label, sizeof(effect_label), "3D Effect: %.0f%%", effect * 100.0f);
+                    ImGui::ProgressBar(effect, ImVec2(-1, 0), effect_label);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Live 3D depth. 100%% = full, 0%% = flat.\nZoom in-game to see it change.");
+                    }
+                }
+            }
+
+            // Auto-depth
+            ImGui::Separator();
+            ImGui::TextDisabled("Auto-Depth");
+
+            {
+                const char* preset_items[] = {"Comfort", "Balanced", "Preserve Depth", "Minimal", "Custom"};
+                int preset_idx = static_cast<int>(cfg.active_preset);
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 55.0f);
+                if (ImGui::Combo("Auto-Depth Preset", &preset_idx, preset_items, IM_ARRAYSIZE(preset_items))) {
+                    auto new_preset = static_cast<vrmod::DepthPreset>(preset_idx);
+                    if (new_preset != vrmod::DepthPreset::Custom) {
+                        gfov.apply_preset(new_preset);
+                    } else {
+                        cfg.active_preset = vrmod::DepthPreset::Custom;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset")) {
+                    gfov.apply_preset(vrmod::DepthPreset::Balanced);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Reset to Balanced preset (recommended defaults).");
+                }
+            }
+
+            // Inline preset description
+            switch (cfg.active_preset) {
+                case vrmod::DepthPreset::Comfort:      ImGui::TextDisabled("Max eye comfort - nearly flat when zoomed"); break;
+                case vrmod::DepthPreset::Balanced:      ImGui::TextDisabled("Recommended - good 3D with comfort"); break;
+                case vrmod::DepthPreset::PreserveDepth: ImGui::TextDisabled("Keeps strong 3D even when zoomed"); break;
+                case vrmod::DepthPreset::Minimal:       ImGui::TextDisabled("Least depth reduction - preserves 3D feel"); break;
+                case vrmod::DepthPreset::Custom:        ImGui::TextDisabled("Your custom settings"); break;
+                default:                               ImGui::TextDisabled("Unknown preset"); break;
+            }
+
+            float global_floor_pct = ms.fGlobalDepthFloor.load(std::memory_order_relaxed) * 100.0f;
+            if (ImGui::SliderFloat("Min 3D Depth", &global_floor_pct, 0.0f, 100.0f, "%.0f%%")) {
+                ms.fGlobalDepthFloor.store(global_floor_pct / 100.0f, std::memory_order_relaxed);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Floor for auto-depth flattening.\n0%% = full flatten, 100%% = always full 3D.");
+            }
+
+            // HUD
+            if (ImGui::TreeNode("HUD Depth & Size")) {
+                // Normal mode
+                {
+                    float hud_scale = ms.fHUDDepthScale.load(std::memory_order_relaxed);
+                    if (!std::isfinite(hud_scale)) hud_scale = 0.0f;
+                    if (ImGui::SliderFloat("HUD 3D Depth", &hud_scale, -2.0f, 2.0f, "%.2f")) {
+                        ms.fHUDDepthScale.store(hud_scale, std::memory_order_relaxed);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("HUD depth during normal gameplay.\n"
+                                          "Negative = popout, 0 = flat, positive = into world.");
+                    }
+                }
+                {
+                    float normal_size = ms.fNormalHUDSize.load(std::memory_order_relaxed);
+                    if (!std::isfinite(normal_size)) normal_size = 1.0f;
+                    if (ImGui::SliderFloat("Normal HUD Size", &normal_size, 0.5f, 2.0f, "%.2f")) {
+                        ms.fNormalHUDSize.store(normal_size, std::memory_order_relaxed);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("HUD size multiplier during normal gameplay.\n"
+                                          "1.0 = base size (from UI Size slider).");
+                    }
+                }
+                // ADS mode
+                {
+                    float ads_depth = ms.fADSHUDDepth.load(std::memory_order_relaxed);
+                    if (!std::isfinite(ads_depth)) ads_depth = 0.0f;
+                    if (ImGui::SliderFloat("ADS HUD Depth", &ads_depth, -2.0f, 2.0f, "%.2f")) {
+                        ms.fADSHUDDepth.store(ads_depth, std::memory_order_relaxed);
+                    }
+                }
+                {
+                    float ads_size = ms.fADSHUDSize.load(std::memory_order_relaxed);
+                    if (!std::isfinite(ads_size)) ads_size = 1.0f;
+                    if (ImGui::SliderFloat("ADS HUD Size", &ads_size, 0.5f, 2.0f, "%.2f")) {
+                        ms.fADSHUDSize.store(ads_size, std::memory_order_relaxed);
+                    }
+                }
+                // Scope mode
+                {
+                    float scope_depth = ms.fScopeHUDDepth.load(std::memory_order_relaxed);
+                    if (!std::isfinite(scope_depth)) scope_depth = 0.0f;
+                    if (ImGui::SliderFloat("Scope HUD Depth", &scope_depth, -2.0f, 2.0f, "%.2f")) {
+                        ms.fScopeHUDDepth.store(scope_depth, std::memory_order_relaxed);
+                    }
+                }
+                {
+                    float scope_size = ms.fScopeHUDSize.load(std::memory_order_relaxed);
+                    if (!std::isfinite(scope_size)) scope_size = 1.0f;
+                    if (ImGui::SliderFloat("Scope HUD Size", &scope_size, 0.5f, 2.0f, "%.2f")) {
+                        ms.fScopeHUDSize.store(scope_size, std::memory_order_relaxed);
+                    }
+                }
+                // Cutscene mode
+                {
+                    float cut_depth = ms.fCutsceneHUDDepth.load(std::memory_order_relaxed);
+                    if (!std::isfinite(cut_depth)) cut_depth = 0.0f;
+                    if (ImGui::SliderFloat("Cutscene HUD Depth", &cut_depth, -2.0f, 2.0f, "%.2f")) {
+                        ms.fCutsceneHUDDepth.store(cut_depth, std::memory_order_relaxed);
+                    }
+                }
+                {
+                    float cut_size = ms.fCutsceneHUDSize.load(std::memory_order_relaxed);
+                    if (!std::isfinite(cut_size)) cut_size = 1.0f;
+                    if (ImGui::SliderFloat("Cutscene HUD Size", &cut_size, 0.5f, 2.0f, "%.2f")) {
+                        ms.fCutsceneHUDSize.store(cut_size, std::memory_order_relaxed);
+                    }
+                }
+                // Auto HUD Size (experimental)
+                {
+                    bool auto_size = ms.bHUDAutoSize.load(std::memory_order_relaxed);
+                    if (ImGui::Checkbox("Auto HUD Size (Experimental)", &auto_size)) {
+                        ms.bHUDAutoSize.store(auto_size, std::memory_order_relaxed);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Automatically scale HUD size based on depth distance.\n"
+                                          "Deeper depth = larger HUD to fill screen.\n"
+                                          "Overrides per-mode size sliders when ON.");
+                    }
+                }
+                // Canvas HUD Hook
+                {
+                    bool canvas_hook = ms.bCanvasHUDHook.load(std::memory_order_relaxed);
+
+                    // One-shot bootstrap: if config loaded canvas_hook=true but hook
+                    // wasn't created yet at config load time, sync it now on first UI draw.
+                    // Static is intentional — only needs to run once per session.
+                    // Subsequent toggles are handled by the Checkbox handler below.
+                    static bool deferred_sync_done = false;
+                    if (!deferred_sync_done && canvas_hook && m_fake_stereo_hook != nullptr) {
+                        if (!m_fake_stereo_hook->set_init_canvas_hook_enabled(true)) {
+                            ms.bCanvasHUDHook.store(false, std::memory_order_relaxed);
+                            canvas_hook = false;
+                        }
+                        deferred_sync_done = true;
+                    }
+
+                    if (ImGui::Checkbox("Canvas HUD Hook", &canvas_hook)) {
+                        ms.bCanvasHUDHook.store(canvas_hook, std::memory_order_relaxed);
+                        if (m_fake_stereo_hook != nullptr) {
+                            if (!m_fake_stereo_hook->set_init_canvas_hook_enabled(canvas_hook)) {
+                                ms.bCanvasHUDHook.store(false, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Hook init_canvas for canvas-rendered HUD depth.\n"
+                                          "OFF by default — may crash some games.\n"
+                                          "Only needed if game HUD uses UE canvas system.\n"
+                                          "Overlay HUD depth works without this.");
+                    }
+                }
+
+                ImGui::TreePop();
+            }
+
+            // Depth tuning
+            if (ImGui::TreeNode("Depth Tuning")) {
+                ImGui::TextDisabled("Fine-tune flattening behavior during zoom");
+                ImGui::Spacing();
+
+                ImGui::Text("Flattening Curve");
+                bool curve_changed = false;
+                curve_changed |= ImGui::SliderFloat("Flattening Strength", &cfg.depth_strength, 0.0f, 2.0f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How aggressively eye separation reduces during zoom.\n"
+                                      "Fixes doubled/crossed guns when ADS crops FOV.\n"
+                                      "0 = off, 1 = default, higher = more aggressive.\n"
+                                      "Increase if guns still look doubled during ADS.");
+                }
+                curve_changed |= ImGui::SliderFloat("Gentle or Aggressive", &cfg.depth_base_power, 0.1f, 2.0f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How the 3D fades as you zoom.\n"
+                                      "Low = gradual fade. High = quick drop.");
+                }
+                curve_changed |= ImGui::SliderFloat("Strong Zoom Falloff", &cfg.depth_extra_power, 0.0f, 2.0f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Extra 3D reduction at high zoom levels.\n"
+                                      "0 = same everywhere, higher = more at deep zoom.");
+                }
+                curve_changed |= ImGui::SliderFloat("ADS Starts At", &cfg.depth_dead_zone, 1.0f, 1.5f, "%.2fx");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Zoom below this factor is ignored (Normal mode).\n"
+                                      "Zoom above this = ADS mode (if aiming).\n"
+                                      "This is the lower boundary of the ADS zone.\n"
+                                      "See Expert > Zoom Classification for the full zone map.");
+                }
+                if (curve_changed) {
+                    cfg.active_preset = vrmod::DepthPreset::Custom;
+                }
+
+                ImGui::Spacing();
+
+                ImGui::Text("Per-Mode Floors");
+                bool floors_changed = false;
+                floors_changed |= ImGui::SliderFloat("When Aiming", &cfg.ads_min_depth, 0.01f, 0.50f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Minimum 3D depth when aiming down sights.\n"
+                                      "Higher = keeps more 3D pop.");
+                }
+                floors_changed |= ImGui::SliderFloat("When Scoped", &cfg.scope_min_depth, 0.01f, 0.30f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Minimum 3D depth at max scope zoom.\n"
+                                      "Usually lowest - scopes flatten a lot.");
+                }
+                floors_changed |= ImGui::SliderFloat("During Cutscenes", &cfg.cutscene_min_depth, 0.01f, 0.60f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Minimum 3D depth in cutscenes.\n"
+                                      "Higher keeps the cinematic 3D feel.");
+                }
+                if (floors_changed) {
+                    cfg.active_preset = vrmod::DepthPreset::Custom;
+                }
+
+                ImGui::Spacing();
+
+                ImGui::Text("Per-Mode Flattening");
+                bool str_changed = false;
+                str_changed |= ImGui::SliderFloat("Flatten: Aiming", &cfg.ads_strength_mult, -2.0f, 100.0f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Scales flattening during ADS.\n"
+                                      "1.0 = base. Negative = popout. Higher = more flat.\n"
+                                      "ADS (shallow zoom) needs 3-5+ for visible effect.");
+                }
+                str_changed |= ImGui::SliderFloat("Flatten: Scoped", &cfg.scope_strength_mult, -2.0f, 100.0f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Scales flattening during scope.\n"
+                                      "1.0 = base. Negative = popout. Higher = more flat.\n"
+                                      "Scope (deep zoom) is sensitive — 1-2 usually enough.");
+                }
+                str_changed |= ImGui::SliderFloat("Flatten: Cutscene", &cfg.cutscene_strength_mult, -2.0f, 100.0f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Scales flattening during cutscenes.\n"
+                                      "1.0 = base. Negative = popout. 0 = preserve cinematic depth.");
+                }
+                if (str_changed) {
+                    cfg.active_preset = vrmod::DepthPreset::Custom;
+                }
+
+                ImGui::TreePop();
+            }
+
+            // Expert
+            if (ImGui::TreeNode("Expert")) {
+                ImGui::TextDisabled("FOV tracking, zoom thresholds, transition speeds");
+                ImGui::Spacing();
+
+                // Viewport HUD Fix removed — RSSetViewports hooking crashed on DX12 runtimes
+                // (PointerHook: different vtable instances, safetyhook inline: access violation in thunk).
+
+                {
+                    const char* fov_mode_items[] = {"Auto", "Manual"};
+                    int fov_mode_idx = static_cast<int>(cfg.fov_mode);
+                    if (ImGui::Combo("FOV Tracking", &fov_mode_idx, fov_mode_items, IM_ARRAYSIZE(fov_mode_items))) {
+                        cfg.fov_mode = static_cast<vrmod::FovMode>(fov_mode_idx);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Auto works for most games. Reads FOV from engine each frame.\n"
+                                          "Switch to Manual if depth behaves erratically.");
+                    }
+                }
+
+                ImGui::Text("Base FOV: %.0f deg", cfg.base_fov);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Calibrate FOV")) {
+                    gfov.calibrate_base_fov();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Sets Base FOV to the game's current camera FOV.\n"
+                        "Press while NOT aiming/zoomed to capture normal FOV.");
+                }
+
+                ImGui::Spacing();
+
+                ImGui::Text("Zoom Classification");
+                // Live zoom indicator
+                {
+                    const auto& zst = vrmod::GameFOV::get().state();
+                    if (zst.is_zooming) {
+                        const char* zone = "?";
+                        ImVec4 color{1, 1, 1, 1};
+                        if (zst.zoom_factor >= cfg.scope_zoom_threshold) {
+                            zone = "SCOPE"; color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+                        } else if (zst.zoom_factor >= cfg.depth_dead_zone) {
+                            zone = "ADS"; color = ImVec4(1.0f, 1.0f, 0.4f, 1.0f);
+                        } else {
+                            zone = "below dead zone"; color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+                        }
+                        ImGui::TextColored(color, ">> Current: %.2fx = %s", zst.zoom_factor, zone);
+                    } else {
+                        ImGui::TextDisabled(">> Not zooming");
+                    }
+                }
+
+                ImGui::SliderFloat("When to Start Flattening", &cfg.zoom_threshold, 1.0f, 20.0f, "%.1f deg");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How many degrees of FOV change before zoom is detected.\n"
+                                      "This is NOT the ADS/Scope boundary (see zoom factor sliders below).\n"
+                                      "Higher = needs more zoom before anything happens.\n"
+                                      "Most users won't need to change this.");
+                }
+                ImGui::SliderFloat("Scope Zoom Threshold", &cfg.scope_zoom_threshold, 1.1f, 3.0f, "%.1fx");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Zoom above this = Scope mode (more flattening).\n"
+                                      "Below this but above dead zone = ADS mode.\n"
+                                      "Aim with different weapons and watch the zone indicator above.");
+                }
+                ImGui::TextDisabled("  Zones: [1.0--%.2fx None] [%.2fx--%.1fx ADS] [%.1fx+ Scope]",
+                    cfg.depth_dead_zone, cfg.depth_dead_zone, cfg.scope_zoom_threshold, cfg.scope_zoom_threshold);
+                ImGui::Spacing();
+
+                ImGui::Text("Transition Speeds");
+                ImGui::SliderFloat("Attack Rate", &cfg.depth_attack_rate, 3.0f, 30.0f, "%.0f Hz");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How fast 3D depth reduces when entering zoom.\nHigher = faster response.");
+                }
+                ImGui::SliderFloat("Release Rate", &cfg.depth_release_rate, 3.0f, 20.0f, "%.0f Hz");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How fast 3D depth recovers when exiting zoom.\nHigher = faster snap-back.");
+                }
+
+                ImGui::Spacing();
+
+                ImGui::Text("FOV Smoothing");
+                ImGui::Checkbox("Smooth FOV Transitions", &cfg.smooth_transitions);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Smooth raw FOV readings from the engine.\nReduces jitter in games with noisy FOV.");
+                }
+                if (cfg.smooth_transitions) {
+                    ImGui::SliderFloat("FOV Lerp Speed", &cfg.lerp_speed, 0.01f, 1.0f, "%.2f");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("FOV smoothing speed. Higher = less lag, Lower = more stable.");
+                    }
+                }
+
+                ImGui::Spacing();
+
+                ImGui::Text("Depth Buffer (Experimental)");
+                {
+                    bool depth_auto = ms.bDepthAutoScale.load(std::memory_order_relaxed);
+                    if (ImGui::Checkbox("Depth Auto-Scale [EXPERIMENTAL]", &depth_auto)) {
+                        ms.bDepthAutoScale.store(depth_auto, std::memory_order_relaxed);
+                        if (depth_auto && !is_depth_enabled()) {
+                            m_enable_depth->value() = true;
+                            spdlog::info("[UE3D] Auto-enabled PassDepthToRuntime for Depth Auto-Scale");
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Uses depth buffer for zoom flattening.\nEXPERIMENTAL: Crashes most UE5 games.\nForced OFF on config load — must re-enable each session.");
+                    }
+
+                    if (depth_auto) {
+                        auto& depth_cfg = vrmod::GameFOV::get().config();
+                        if (ImGui::SliderFloat("Depth Sensitivity", &depth_cfg.depth_ws_response, 0.1f, 1.0f, "%.2f")) {
+                            depth_cfg.active_preset = vrmod::DepthPreset::Custom;
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("How strongly depth reading affects stereo.\n0.1 = subtle, 1.0 = aggressive.");
+                        }
+
+                        auto& depth_st = vrmod::GameFOV::get().state();
+                        ImGui::TextDisabled("Depth: %.3f  Smoothed: %.3f  WS Mod: %.2fx",
+                            depth_st.center_depth, depth_st.smoothed_depth, depth_st.depth_ws_modifier);
+                    }
+                }
+
+                ImGui::TreePop();
+            }
+
+            // LookAround (Leia eye tracking)
+            if (ImGui::TreeNode("LookAround")) {
+                ImGui::TextDisabled("Head tracking parallax for Leia displays");
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Note: Enable after loading into the game, not at the start menu.");
+                ImGui::Spacing();
+
+                bool look_enabled = ms.bLeiaLookAroundEnabled.load(std::memory_order_relaxed);
+                if (ImGui::Checkbox("Enable LookAround", &look_enabled)) {
+                    ms.bLeiaLookAroundEnabled.store(look_enabled, std::memory_order_relaxed);
+                }
+
+                if (look_enabled) {
+                    float sensitivity = ms.fLeiaSensitivity.load(std::memory_order_relaxed);
+                    if (ImGui::SliderFloat("Sensitivity", &sensitivity, 0.1f, 5.0f, "%.2f")) {
+                        if (std::isfinite(sensitivity)) {
+                            ms.fLeiaSensitivity.store(sensitivity, std::memory_order_relaxed);
+                        }
+                    }
+
+                    float smoothing = ms.fLeiaSmoothing.load(std::memory_order_relaxed);
+                    if (ImGui::SliderFloat("Smoothing", &smoothing, 0.01f, 1.0f, "%.2f")) {
+                        if (std::isfinite(smoothing)) {
+                            ms.fLeiaSmoothing.store(smoothing, std::memory_order_relaxed);
+                        }
+                    }
+
+                    // Per-axis enable
+                    bool axis_x = ms.bLeiaAxisX.load(std::memory_order_relaxed);
+                    bool axis_y = ms.bLeiaAxisY.load(std::memory_order_relaxed);
+                    bool axis_z = ms.bLeiaAxisZ.load(std::memory_order_relaxed);
+                    if (ImGui::Checkbox("X (horizontal)", &axis_x)) {
+                        ms.bLeiaAxisX.store(axis_x, std::memory_order_relaxed);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Y (vertical)", &axis_y)) {
+                        ms.bLeiaAxisY.store(axis_y, std::memory_order_relaxed);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Z (depth)", &axis_z)) {
+                        ms.bLeiaAxisZ.store(axis_z, std::memory_order_relaxed);
+                    }
+
+                    // Per-axis invert (physics default is window mode; invert flips to track)
+                    bool inv_x = ms.bLeiaInvertX.load(std::memory_order_relaxed);
+                    bool inv_y = ms.bLeiaInvertY.load(std::memory_order_relaxed);
+                    bool inv_z = ms.bLeiaInvertZ.load(std::memory_order_relaxed);
+                    if (axis_x) {
+                        if (ImGui::Checkbox("Invert X", &inv_x)) {
+                            ms.bLeiaInvertX.store(inv_x, std::memory_order_relaxed);
+                        }
+                        ImGui::SameLine();
+                    }
+                    if (axis_y) {
+                        if (ImGui::Checkbox("Invert Y", &inv_y)) {
+                            ms.bLeiaInvertY.store(inv_y, std::memory_order_relaxed);
+                        }
+                        ImGui::SameLine();
+                    }
+                    if (axis_z) {
+                        if (ImGui::Checkbox("Invert Z", &inv_z)) {
+                            ms.bLeiaInvertZ.store(inv_z, std::memory_order_relaxed);
+                        }
+                    }
+
+                    // Motion parallax: near objects shift fast, far barely move
+                    float motion = ms.fLeiaMotionParallax.load(std::memory_order_relaxed);
+                    if (ImGui::SliderFloat("Motion Depth", &motion, 0.0f, 3.0f, "%.2f")) {
+                        if (std::isfinite(motion)) {
+                            ms.fLeiaMotionParallax.store(motion, std::memory_order_relaxed);
+                        }
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("Near fast, far slow");
+
+                    if (axis_z) {
+                        float z_depth = ms.fLeiaZDepthStrength.load(std::memory_order_relaxed);
+                        if (ImGui::SliderFloat("Z Depth", &z_depth, 0.0f, 3.0f, "%.2f")) {
+                            if (std::isfinite(z_depth)) {
+                                ms.fLeiaZDepthStrength.store(z_depth, std::memory_order_relaxed);
+                            }
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("FOV + stereo");
+
+                        bool inv_zs = ms.bLeiaInvertZStereo.load(std::memory_order_relaxed);
+                        if (ImGui::Checkbox("Invert Z Stereo", &inv_zs)) {
+                            ms.bLeiaInvertZStereo.store(inv_zs, std::memory_order_relaxed);
+                        }
+                    }
+
+                    if (ImGui::Button("Recalibrate")) {
+                        vrmod::UE3D_Bridge::get().reset_leia_calibration();
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+
+                    // Status
+                    bool tracking = ms.bLeiaTracking.load(std::memory_order_relaxed);
+                    uint32_t frames = ms.uLeiaFrameCounter.load(std::memory_order_relaxed);
+                    ImGui::Text("Tracking: %s  Frames: %u", tracking ? "Active" : "Inactive", frames);
+                    if (tracking) {
+                        ImGui::Text("Head: X=%.2f  Y=%.2f  Z=%.2f cm",
+                            ms.leia_head_x_safe(), ms.leia_head_y_safe(), ms.leia_head_z_safe());
+                    }
+
+                    float dw = ms.fLeiaDisplayWidthCm.load(std::memory_order_relaxed);
+                    float dh = ms.fLeiaDisplayHeightCm.load(std::memory_order_relaxed);
+                    if (dw > 0.0f && dh > 0.0f) {
+                        ImGui::Text("Display: %.1f x %.1f cm", dw, dh);
+                    }
+                }
+
+                ImGui::TreePop();
+            }
+
+            // Status
+            if (ImGui::TreeNode("Status")) {
+                ImGui::Text("Stereo: %.4f  Conv: %.2f", ms.stereo_depth_safe(), ms.convergence_safe());
+                ImGui::Text("Mode: %s  Aim: %s",
+                    vrmod::GameFOV::depth_mode_name(gfov.get_depth_mode()),
+                    ms.bIsAiming.load(std::memory_order_relaxed) ? "yes" : "no");
+                ImGui::Text("DynDepth: %.3f  DynConv: %.3f",
+                    ms.dyn_depth_safe(), ms.dyn_conv_safe());
+
+                ImGui::Spacing();
+                ImGui::Text("FOV State:");
+                ImGui::Text("  Game FOV:    %.1f deg", st.game_fov);
+                ImGui::Text("  Base FOV:    %.1f deg", cfg.base_fov);
+                ImGui::Text("  Current FOV: %.1f deg (smoothed)", st.current_fov);
+                ImGui::Text("  FOV Scale:   %.3f", gfov.get_fov_scale());
+                ImGui::Text("  FOV Valid:   %s", st.fov_valid ? "YES" : "no");
+                ImGui::Text("  FOV Mode:    %s", vrmod::GameFOV::fov_mode_name(cfg.fov_mode));
+                ImGui::Text("  Calibrated:  %s",
+                    ms.bFOVCalibrated.load(std::memory_order_relaxed) ? "yes" : "no");
+
+                ImGui::Spacing();
+                ImGui::Text("Zoom State:");
+                ImGui::Text("  Zooming:     %s", st.is_zooming ? "YES" : "no");
+                ImGui::Text("  Zoom Factor: %.2fx", st.zoom_factor);
+                ImGui::Text("  Zoom Time:   %.1f s", st.zoom_duration);
+                ImGui::Text("  Pawn Valid:  %s", st.player_pawn_valid ? "YES" : "no");
+
+                ImGui::Spacing();
+                ImGui::Text("Depth Engine:");
+                ImGui::Text("  Mode:        %s (%.1fs)", vrmod::GameFOV::depth_mode_name(st.depth_mode), st.depth_mode_duration);
+                ImGui::Text("  FOV Velocity: %.0f deg/s", st.fov_velocity);
+                ImGui::Text("  Target Mult: %.3f", st.target_depth_multiplier);
+                ImGui::Text("  Current Mult: %.3f", st.current_depth_multiplier);
+                ImGui::Text("  Preset:      %s", vrmod::GameFOV::preset_name(cfg.active_preset));
+
+                ImGui::Spacing();
+                ImGui::Text("VRto3D Bridge:");
+                ImGui::Text("  Connected:   %s", st.vrto3d_connected ? "YES" : "no");
+                ImGui::Text("  Profile:     %s", st.vrto3d_profile_loaded ? "loaded" : "none");
+
+                // Debug diagnostics
+                if (cfg.debug_logging) {
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Debug Diagnostics:");
+
+                    // Force Flat toggle — zeros ALL stereo output for isolation testing
+                    bool force_flat = ms.bForceFlat.load(std::memory_order_relaxed);
+                    if (ImGui::Checkbox("Force Flat (zero all stereo)", &force_flat)) {
+                        ms.bForceFlat.store(force_flat, std::memory_order_relaxed);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Forces eye offset=0 and convergence=0.\n"
+                            "If HUD elements still show separation with this ON,\n"
+                            "the separation comes from outside UEVR's stereo hooks.");
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Text("Per-Frame Hook Calls:");
+                    ImGui::Text("  ViewOffset:  %u", ms.uViewOffsetCallsSnapshot.load(std::memory_order_relaxed));
+                    ImGui::Text("  Projection:  %u", ms.uProjectionCallsSnapshot.load(std::memory_order_relaxed));
+                    ImGui::Text("  Slate Hook:  %u", ms.uSlateHookCallsSnapshot.load(std::memory_order_relaxed));
+                    ImGui::Text("  Canvas Hook: %u", ms.uCanvasHookCallsSnapshot.load(std::memory_order_relaxed));
+
+                    ImGui::Spacing();
+                    ImGui::Text("Last Applied Stereo:");
+                    ImGui::Text("  Eye Offset:  %.4f UE units", ms.fLastEyeOffset.load(std::memory_order_relaxed));
+                    ImGui::Text("  Conv Shift:  %.6f NDC", ms.fLastConvergenceShift.load(std::memory_order_relaxed));
+                    ImGui::Text("  3D Strength: %.2f", ms.strength_safe());
+                }
+
+                ImGui::TreePop();
+            }
+
+        } // end if (monitor_mode)
     }
 
     if (selected_page == PAGE_UNREAL) {

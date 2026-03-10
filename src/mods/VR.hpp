@@ -110,6 +110,7 @@ public:
     std::vector<SidebarEntryInfo> get_sidebar_entries() override {
         return {
             {"Runtime", false},
+            {"Monitor 3D", false},
             {"Unreal", false},
             {"Input", false},
             {"Camera", false},

@@ -17,6 +17,9 @@
 
 #include "../../VR.hpp"
 #include "OpenXR.hpp"
+#include "../GameFOV.hpp"
+#include "../ue3d/UE3D_MonitorState.hpp"
+#include <cstring>  // for memcmp
 
 using namespace nlohmann;
 
@@ -553,25 +556,86 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
         };
     };
 
-    // if we've not yet derived an eye projection matrix, or we've changed the projection, derive it here
-    // Hacky way to check for an uninitialised eye matrix - is there something better, is this necessary?
-    if (this->should_recalculate_eye_projections || this->last_eye_matrix_nearz != nearz || this->projections[0][2][3] == 0) {
-        // deriving the texture bounds when modifying projections requires left and right raw projections so get them all before we start:
-        std::unique_lock __{this->eyes_mtx};
-        const auto& left_fov = this->views[0].fov;
-        this->raw_projections[0][0] = tan(left_fov.angleLeft);
-        this->raw_projections[0][1] = tan(left_fov.angleRight);
-        this->raw_projections[0][2] = tan(left_fov.angleUp);
-        this->raw_projections[0][3] = tan(left_fov.angleDown);
-        const auto& right_fov = this->views[1].fov;
-        this->raw_projections[1][0] = tan(right_fov.angleLeft);
-        this->raw_projections[1][1] = tan(right_fov.angleRight);
-        this->raw_projections[1][2] = tan(right_fov.angleUp);
-        this->raw_projections[1][3] = tan(right_fov.angleDown);
-        this->projections[0] = get_mat(0);
-        this->projections[1] = get_mat(1);
-        this->should_recalculate_eye_projections = false;
-        this->last_eye_matrix_nearz = nearz;
+    // Monitor mode: FOV change detection + scope zoom scaling
+    const bool is_monitor = ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed);
+    if (is_monitor) {
+        // VRto3D convergence fix — detect if VRto3D changed the HMD FOV
+        bool fov_changed = false;
+        if (!m_fov_initialized) {
+            m_fov_initialized = true;
+            fov_changed = true;
+        } else {
+            if (std::memcmp(&this->views[0].fov, &m_last_fovs[0], sizeof(XrFovf)) != 0 ||
+                std::memcmp(&this->views[1].fov, &m_last_fovs[1], sizeof(XrFovf)) != 0) {
+                fov_changed = true;
+            }
+        }
+        m_last_fovs[0] = this->views[0].fov;
+        m_last_fovs[1] = this->views[1].fov;
+
+        // Game FOV passthrough (scope zoom)
+        auto& game_fov = vrmod::GameFOV::get();
+        float fov_scale = game_fov.get_fov_scale();
+
+        // Recalculate if FOV changed (VRto3D convergence) or fov_scale changed (zoom enter/exit)
+        if (fov_changed || fov_scale != m_game_fov_scale) {
+            this->should_recalculate_eye_projections = true;
+        }
+        m_game_fov_scale = fov_scale;
+
+        if (this->should_recalculate_eye_projections || this->last_eye_matrix_nearz != nearz || this->projections[0][2][3] == 0) {
+            std::unique_lock __{this->eyes_mtx};
+
+            // Get base FOV from views
+            XrFovf left_fov = this->views[0].fov;
+            XrFovf right_fov = this->views[1].fov;
+
+            // Apply game FOV scaling for scope zoom
+            if (fov_scale < 1.0f) {
+                left_fov.angleLeft *= fov_scale;
+                left_fov.angleRight *= fov_scale;
+                left_fov.angleUp *= fov_scale;
+                left_fov.angleDown *= fov_scale;
+
+                right_fov.angleLeft *= fov_scale;
+                right_fov.angleRight *= fov_scale;
+                right_fov.angleUp *= fov_scale;
+                right_fov.angleDown *= fov_scale;
+            }
+
+            // Calculate raw projections with (potentially scaled) FOV
+            this->raw_projections[0][0] = tan(left_fov.angleLeft);
+            this->raw_projections[0][1] = tan(left_fov.angleRight);
+            this->raw_projections[0][2] = tan(left_fov.angleUp);
+            this->raw_projections[0][3] = tan(left_fov.angleDown);
+            this->raw_projections[1][0] = tan(right_fov.angleLeft);
+            this->raw_projections[1][1] = tan(right_fov.angleRight);
+            this->raw_projections[1][2] = tan(right_fov.angleUp);
+            this->raw_projections[1][3] = tan(right_fov.angleDown);
+            this->projections[0] = get_mat(0);
+            this->projections[1] = get_mat(1);
+            this->should_recalculate_eye_projections = false;
+            this->last_eye_matrix_nearz = nearz;
+        }
+    } else {
+        // VR mode: upstream projection derivation
+        if (this->should_recalculate_eye_projections || this->last_eye_matrix_nearz != nearz || this->projections[0][2][3] == 0) {
+            std::unique_lock __{this->eyes_mtx};
+            const auto& left_fov = this->views[0].fov;
+            this->raw_projections[0][0] = tan(left_fov.angleLeft);
+            this->raw_projections[0][1] = tan(left_fov.angleRight);
+            this->raw_projections[0][2] = tan(left_fov.angleUp);
+            this->raw_projections[0][3] = tan(left_fov.angleDown);
+            const auto& right_fov = this->views[1].fov;
+            this->raw_projections[1][0] = tan(right_fov.angleLeft);
+            this->raw_projections[1][1] = tan(right_fov.angleRight);
+            this->raw_projections[1][2] = tan(right_fov.angleUp);
+            this->raw_projections[1][3] = tan(right_fov.angleDown);
+            this->projections[0] = get_mat(0);
+            this->projections[1] = get_mat(1);
+            this->should_recalculate_eye_projections = false;
+            this->last_eye_matrix_nearz = nearz;
+        }
     }
     // don't allow the eye matrices to be derived again until after the next frame sync
     this->should_update_eye_matrices = false;
@@ -1812,7 +1876,19 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
             int32_t offset_x = 0, offset_y = 0, extent_x = 0, extent_y = 0;
             // if we're working with a double-wide texture, use half the view bounds adjustment (as they apply to a single eye)
             int texture_area_width = is_afr ? swapchain->width : swapchain->width / 2;
-            if (is_afr || i == 0) {
+            const bool is_monitor = ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed);
+            if (is_monitor) {
+                // Monitor mode: full uncropped rectangle — symmetric frustum, no view_bounds crop needed
+                if (is_afr || i == 0) {
+                    offset_x = 0;
+                    extent_x = texture_area_width;
+                } else {
+                    offset_x = texture_area_width;
+                    extent_x = texture_area_width;
+                }
+                offset_y = 0;
+                extent_y = swapchain->height;
+            } else if (is_afr || i == 0) {
                 offset_x = view_bounds[i][0] * texture_area_width;
                 extent_x = view_bounds[i][1] * texture_area_width - offset_x;
             } else {
@@ -1820,8 +1896,10 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
                 offset_x = texture_area_width + view_bounds[i][0] * texture_area_width;
                 extent_x = view_bounds[i][1] * texture_area_width - (offset_x - texture_area_width);
             }
-            offset_y = view_bounds[i][2] * swapchain->height;
-            extent_y = view_bounds[i][3] * swapchain->height - offset_y;
+            if (!is_monitor) {
+                offset_y = view_bounds[i][2] * swapchain->height;
+                extent_y = view_bounds[i][3] * swapchain->height - offset_y;
+            }
             
             // SPDLOG_INFO("image calc for eye {} {}, {}, {}, {}", i, offset_x, extent_x, offset_y, extent_y);
             projection_layer_views[i].subImage.imageRect.offset = {offset_x, offset_y};
