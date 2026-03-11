@@ -906,8 +906,9 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
         const float hud_mult = ms.hud_depth_mult_safe();
         const float distance = m_parent->m_slate_distance->value() * std::max(0.1f, hud_mult);
 
-        // Size overlay to fill display frustum at this distance
-        const float display_fov = ms.display_base_fov_safe();
+        // Size overlay from fixed reference FOV — user controls sizing via UI Size slider per game.
+        // Dynamic game FOV caused timing-dependent HUD shifts (Issue #9: sprint recalibration).
+        const float display_fov = 90.0f;
         const float fov_rad = glm::radians(std::max(ue3d::constants::OVERLAY_FOV_MIN, display_fov));
         const float half_h = distance * std::tan(fov_rad * 0.5f);
         const float aspect = (float)ui_swapchain.width / (float)ui_swapchain.height;

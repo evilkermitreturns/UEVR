@@ -3280,9 +3280,9 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     auto& vr = VR::get();
     auto rtm = g_hook->get_render_target_manager();
 
-    // Native fix: scene capture path
+    // Native fix: scene capture path (monitor mode excluded — scene capture requires VR runtime state)
     const bool is_monitor = ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed);
-    if ((!vr->is_hmd_active() && !is_monitor) || !vr->is_native_stereo_fix_enabled()) {
+    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || is_monitor) {
         rtm->destroy_scene_capture();
 
         g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
@@ -4722,11 +4722,7 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
             true_index = g_frame_count % 2;
         }
 
-        if (!vr->is_native_stereo_fix_enabled()) {
-            *x = half_w * true_index;
-        } else {
-            *x = 0;
-        }
+        *x = half_w * true_index;
         *y = 0;
         *w = half_w;
         *h = eye_h;
@@ -5632,10 +5628,8 @@ uint32_t FFakeStereoRenderingHook::get_desired_number_of_views_hook(FFakeStereoR
         return 2;
     }
 
-    // Monitor mode view count — when native stereo fix is enabled, fall through to the
-    // scene capture readiness check below so begin_render_viewfamily_real can use it.
-    if (is_stereo_enabled && ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)
-        && !vr->is_native_stereo_fix_enabled()) {
+    // Monitor mode view count — always return early (native stereo fix excluded in monitor mode)
+    if (is_stereo_enabled && ue3d::MonitorState::get().bMonitorMode.load(std::memory_order_relaxed)) {
         // Ghosting fix: temporarily return 2 to discover second scene state
         if (vr->is_ghosting_fix_enabled() && vr->is_using_afr() &&
             g_hook->m_sceneview_data.known_scene_states.size() < 2 &&
